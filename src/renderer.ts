@@ -40,17 +40,17 @@ function drawWithBackground(
   const maskW = mask.width
   const maskH = mask.height
 
-  // For each pixel: if mask says background (0), replace with bgColor
+  // For each canvas pixel: look up the corresponding mask value.
+  // Iterate canvas pixels (not mask pixels) so every pixel is covered.
   const bg = parseCssColor(bgColor)
-  for (let my = 0; my < maskH; my++) {
-    for (let mx = 0; mx < maskW; mx++) {
-      // Map mask pixel → canvas pixel (mask may be lower resolution)
-      const cx = Math.floor((mx / maskW) * W)
-      const cy = Math.floor((my / maskH) * H)
-      // Mask is in original (un-mirrored) space; mirror the x lookup
-      const mirroredMx = maskW - 1 - mx
-      const maskIdx = my * maskW + mirroredMx
-      const isMaskBackground = maskArr[maskIdx] !== 0
+  for (let cy = 0; cy < H; cy++) {
+    for (let cx = 0; cx < W; cx++) {
+      // The video was drawn mirrored, so canvas cx=0 is video right edge.
+      // Un-mirror to find the original video x, then scale to mask coords.
+      const videoX = W - 1 - cx
+      const mx = Math.min(maskW - 1, Math.floor((videoX / W) * maskW))
+      const my = Math.min(maskH - 1, Math.floor((cy / H) * maskH))
+      const isMaskBackground = maskArr[my * maskW + mx] !== 0
 
       if (isMaskBackground) {
         const pi = (cy * W + cx) * 4
