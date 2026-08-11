@@ -108,6 +108,24 @@
       pointer-events: none;
       white-space: nowrap;
     }
+
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    #bgPicker {
+      width: 36px;
+      height: 36px;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 10px;
+      background: none;
+      cursor: pointer;
+      padding: 2px;
+      backdrop-filter: blur(12px);
+    }
+    #bgPicker::-webkit-color-swatch-wrapper { padding: 0; border-radius: 8px; }
+    #bgPicker::-webkit-color-swatch { border: none; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -117,6 +135,10 @@
     <button class="btn" id="debugBtn">Debug Skeleton</button>
     <button class="btn" id="addBtn">+ Add Objects</button>
     <button class="btn" id="clearBtn">Clear Objects</button>
+    <div class="btn-row">
+      <button class="btn" id="bgBtn" style="flex:1">Replace Background</button>
+      <input type="color" id="bgPicker" value="#00ff88" title="Background color" />
+    </div>
   </div>
 
   <div id="status">Initializing...</div>

@@ -1,7 +1,7 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
-import type { PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
+import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 const BODY_RADIUS = 26
@@ -30,11 +30,16 @@ async function main() {
   const debugBtn = document.getElementById('debugBtn') as HTMLButtonElement
   const addBtn = document.getElementById('addBtn') as HTMLButtonElement
   const clearBtn = document.getElementById('clearBtn') as HTMLButtonElement
+  const bgBtn = document.getElementById('bgBtn') as HTMLButtonElement
+  const bgPicker = document.getElementById('bgPicker') as HTMLInputElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
   let debugMode = true
+  let bgEnabled = false
+  let bgColor = '#00ff88'
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
+  let lastSeg: ImageSegmenterResult | null = null
   let prevTimestamp = 0
 
   // Camera
@@ -100,6 +105,11 @@ async function main() {
     for (let i = 0; i < 4; i++) physics.spawnObject()
   })
   clearBtn.addEventListener('click', () => physics.clearObjects())
+  bgBtn.addEventListener('click', () => {
+    bgEnabled = !bgEnabled
+    bgBtn.classList.toggle('active', bgEnabled)
+  })
+  bgPicker.addEventListener('input', () => { bgColor = bgPicker.value })
 
   // Per-hand pinch tracking
   const pinchWas = new Map<number, boolean>()
@@ -113,6 +123,7 @@ async function main() {
     if (result) {
       lastPose = result.pose
       lastHands = result.hands
+      lastSeg = result.segmentation
     }
 
     // --- Pose → physics bodies ---
@@ -209,7 +220,7 @@ async function main() {
     physics.step(dt)
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, lastSeg, bgColor, bgEnabled)
 
     requestAnimationFrame(loop)
   }

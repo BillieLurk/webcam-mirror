@@ -1,6 +1,79 @@
-import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
+import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 import type { FloatingObject } from './physics'
 import { detectFist, getPalmCenter } from './tracker'
+
+// Offscreen canvases for background replacement compositing, lazily created
+let offVideo: OffscreenCanvas | null = null
+let offVideoCtx: OffscreenCanvasRenderingContext2D | null = null
+
+function ensureOffscreen(w: number, h: number) {
+  if (!offVideo || offVideo.width !== w || offVideo.height !== h) {
+    offVideo = new OffscreenCanvas(w, h)
+    offVideoCtx = offVideo.getContext('2d')!
+  }
+}
+
+function drawWithBackground(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  segmentation: { categoryMask?: { getAsUint8Array(): Uint8Array; width: number; height: number } },
+  bgColor: string,
+  W: number,
+  H: number,
+) {
+  ensureOffscreen(W, H)
+  const oc = offVideoCtx!
+
+  // Draw mirrored video into offscreen canvas
+  oc.save()
+  oc.translate(W, 0)
+  oc.scale(-1, 1)
+  oc.drawImage(video, 0, 0, W, H)
+  oc.restore()
+
+  // Get video pixel data and segmentation mask
+  const videoData = oc.getImageData(0, 0, W, H)
+  const pixels = videoData.data
+
+  const mask = segmentation.categoryMask!
+  const maskArr = mask.getAsUint8Array()
+  const maskW = mask.width
+  const maskH = mask.height
+
+  // For each pixel: if mask says background (0), replace with bgColor
+  const bg = parseCssColor(bgColor)
+  for (let my = 0; my < maskH; my++) {
+    for (let mx = 0; mx < maskW; mx++) {
+      // Map mask pixel → canvas pixel (mask may be lower resolution)
+      const cx = Math.floor((mx / maskW) * W)
+      const cy = Math.floor((my / maskH) * H)
+      // Mask is in original (un-mirrored) space; mirror the x lookup
+      const mirroredMx = maskW - 1 - mx
+      const maskIdx = my * maskW + mirroredMx
+      const isMaskBackground = maskArr[maskIdx] === 0
+
+      if (isMaskBackground) {
+        const pi = (cy * W + cx) * 4
+        pixels[pi]     = bg[0]
+        pixels[pi + 1] = bg[1]
+        pixels[pi + 2] = bg[2]
+        pixels[pi + 3] = 255
+      }
+    }
+  }
+
+  ctx.putImageData(videoData, 0, 0)
+}
+
+/** Parse a CSS hex color like "#rrggbb" into [r, g, b]. */
+function parseCssColor(hex: string): [number, number, number] {
+  const c = hex.replace('#', '')
+  return [
+    parseInt(c.slice(0, 2), 16),
+    parseInt(c.slice(2, 4), 16),
+    parseInt(c.slice(4, 6), 16),
+  ]
+}
 
 // All pose skeleton connections
 const POSE_CONNECTIONS: [number, number][] = [
@@ -47,17 +120,24 @@ export function renderFrame(
   handResult: HandLandmarkerResult | null,
   debugMode: boolean,
   grabbing: Map<number, boolean>,
+  segmentation: ImageSegmenterResult | null,
+  bgColor: string,
+  bgEnabled: boolean,
 ) {
   const { width: W, height: H } = ctx.canvas
 
   ctx.clearRect(0, 0, W, H)
 
-  // Mirrored video
-  ctx.save()
-  ctx.translate(W, 0)
-  ctx.scale(-1, 1)
-  ctx.drawImage(video, 0, 0, W, H)
-  ctx.restore()
+  if (bgEnabled && segmentation?.categoryMask) {
+    drawWithBackground(ctx, video, segmentation, bgColor, W, H)
+  } else {
+    // Plain mirrored video
+    ctx.save()
+    ctx.translate(W, 0)
+    ctx.scale(-1, 1)
+    ctx.drawImage(video, 0, 0, W, H)
+    ctx.restore()
+  }
 
   // Subtle dark vignette to improve contrast of overlays
   ctx.fillStyle = 'rgba(0,0,0,0.12)'
