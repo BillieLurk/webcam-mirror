@@ -126,6 +126,20 @@
     }
     #bgPicker::-webkit-color-swatch-wrapper { padding: 0; border-radius: 8px; }
     #bgPicker::-webkit-color-swatch { border: none; border-radius: 8px; }
+
+    #depthIP {
+      width: 100%;
+      padding: 7px 10px;
+      background: rgba(0,0,0,0.4);
+      color: rgba(255,255,255,0.85);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      font-size: 12px;
+      backdrop-filter: blur(12px);
+      outline: none;
+    }
+    #depthIP::placeholder { color: rgba(255,255,255,0.3); }
+    #depthIP:focus { border-color: rgba(76,201,240,0.6); }
   </style>
 </head>
 <body>
@@ -138,6 +152,10 @@
     <div class="btn-row">
       <button class="btn" id="bgBtn" style="flex:1">Replace Background</button>
       <input type="color" id="bgPicker" value="#00ff88" title="Background color" />
+    </div>
+    <div style="border-top: 1px solid rgba(255,255,255,0.1); padding-top: 8px; display:flex; flex-direction:column; gap:6px;">
+      <input id="depthIP" type="text" placeholder="Mac IP  e.g. 192.168.1.42" autocomplete="off" spellcheck="false" />
+      <button class="btn" id="depthBtn">Connect Depth Camera</button>
     </div>
   </div>
 

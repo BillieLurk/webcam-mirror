@@ -1,5 +1,6 @@
 import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 import type { FloatingObject } from './physics'
+import type { DepthFrame } from './depth-receiver'
 import { detectFist, getPalmCenter } from './tracker'
 
 // Offscreen canvases for background replacement compositing, lazily created
@@ -74,6 +75,61 @@ function drawWithBackground(
   ctx.putImageData(videoData, 0, 0)
 }
 
+/**
+ * Depth-camera compositing path.
+ * The iPhone sends its own color frame (already the right source of truth)
+ * alongside per-pixel depth in metres. Pixels beyond `threshold` metres are
+ * replaced with the solid background color.
+ *
+ * The color frame is landscape from the rear camera so we rotate it 90°
+ * by drawing it transposed onto an offscreen canvas.
+ */
+function drawWithDepth(
+  ctx: CanvasRenderingContext2D,
+  frame: DepthFrame,
+  bgColor: string,
+  W: number,
+  H: number,
+) {
+  ensureOffscreen(W, H)
+  const oc = offVideoCtx!
+
+  // Draw the iPhone color frame scaled to canvas (it arrives as landscape bitmap)
+  oc.clearRect(0, 0, W, H)
+  oc.drawImage(frame.colorBitmap, 0, 0, W, H)
+
+  const imageData = oc.getImageData(0, 0, W, H)
+  const pixels = imageData.data
+  const bg = parseCssColor(bgColor)
+
+  const { depthData, depthWidth: dw, depthHeight: dh } = frame
+
+  // Depth threshold: pixels beyond this distance (metres) become background.
+  // A good starting value for a person standing ~1-2m away is 2.5m.
+  const THRESHOLD = 2.5
+
+  for (let cy = 0; cy < H; cy++) {
+    const fy = (cy / H) * dh
+    for (let cx = 0; cx < W; cx++) {
+      const fx = (cx / W) * dw
+      const depth = sampleBilinear(depthData, dw, dh, fx, fy)
+
+      // depth === 0 means "no data" from sensor — treat as background
+      const isBackground = depth === 0 || depth > THRESHOLD
+
+      if (isBackground) {
+        const pi = (cy * W + cx) * 4
+        pixels[pi]     = bg[0]
+        pixels[pi + 1] = bg[1]
+        pixels[pi + 2] = bg[2]
+        pixels[pi + 3] = 255
+      }
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+}
+
 /** Parse a CSS hex color like "#rrggbb" into [r, g, b]. */
 function parseCssColor(hex: string): [number, number, number] {
   const c = hex.replace('#', '')
@@ -132,15 +188,21 @@ export function renderFrame(
   segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
   bgEnabled: boolean,
+  depthFrame: DepthFrame | null,
+  _depthThreshold: number,
 ) {
   const { width: W, height: H } = ctx.canvas
 
   ctx.clearRect(0, 0, W, H)
 
-  if (bgEnabled && segmentation?.confidenceMasks?.length) {
+  if (depthFrame) {
+    // Depth camera path: use iPhone color + depth for background removal
+    drawWithDepth(ctx, depthFrame, bgColor, W, H)
+  } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
+    // ML segmentation path: webcam + MediaPipe confidence mask
     drawWithBackground(ctx, video, segmentation, bgColor, W, H)
   } else {
-    // Plain mirrored video
+    // Plain mirrored webcam
     ctx.save()
     ctx.translate(W, 0)
     ctx.scale(-1, 1)

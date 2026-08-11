@@ -1,6 +1,8 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
+import { DepthReceiver } from './depth-receiver'
+import type { DepthFrame } from './depth-receiver'
 import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
@@ -32,6 +34,8 @@ async function main() {
   const clearBtn = document.getElementById('clearBtn') as HTMLButtonElement
   const bgBtn = document.getElementById('bgBtn') as HTMLButtonElement
   const bgPicker = document.getElementById('bgPicker') as HTMLInputElement
+  const depthBtn = document.getElementById('depthBtn') as HTMLButtonElement
+  const depthIPInput = document.getElementById('depthIP') as HTMLInputElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
   let debugMode = true
@@ -40,7 +44,16 @@ async function main() {
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
   let lastSeg: ImageSegmenterResult | null = null
+  let lastDepthFrame: DepthFrame | null = null
   let prevTimestamp = 0
+
+  // Depth camera receiver
+  const depthReceiver = new DepthReceiver()
+  depthReceiver.onFrame = (frame) => { lastDepthFrame = frame }
+  depthReceiver.onStatusChange = (connected) => {
+    depthBtn.classList.toggle('active', connected)
+    depthBtn.textContent = connected ? 'Depth: Connected' : 'Connect Depth Camera'
+  }
 
   // Camera
   statusEl.textContent = 'Requesting camera...'
@@ -110,6 +123,16 @@ async function main() {
     bgBtn.classList.toggle('active', bgEnabled)
   })
   bgPicker.addEventListener('input', () => { bgColor = bgPicker.value })
+  depthBtn.addEventListener('click', () => {
+    if (depthReceiver.connected) {
+      depthReceiver.disconnect()
+      lastDepthFrame = null
+    } else {
+      const ip = depthIPInput.value.trim()
+      if (!ip) { depthIPInput.focus(); return }
+      depthReceiver.connect(`ws://${ip}:8080/view`)
+    }
+  })
 
   // Per-hand pinch tracking
   const pinchWas = new Map<number, boolean>()
@@ -220,7 +243,7 @@ async function main() {
     physics.step(dt)
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, lastSeg, bgColor, bgEnabled)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5)
 
     requestAnimationFrame(loop)
   }
