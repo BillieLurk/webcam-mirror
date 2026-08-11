@@ -50,7 +50,7 @@ function drawWithBackground(
       // Mask is in original (un-mirrored) space; mirror the x lookup
       const mirroredMx = maskW - 1 - mx
       const maskIdx = my * maskW + mirroredMx
-      const isMaskBackground = maskArr[maskIdx] === 0
+      const isMaskBackground = maskArr[maskIdx] !== 0
 
       if (isMaskBackground) {
         const pi = (cy * W + cx) * 4
