@@ -13,10 +13,19 @@ function ensureOffscreen(w: number, h: number) {
   }
 }
 
+function sampleBilinear(arr: Float32Array, mw: number, mh: number, fx: number, fy: number): number {
+  const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, mw - 1)
+  const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, mh - 1)
+  const tx = fx - x0, ty = fy - y0
+  const v00 = arr[y0 * mw + x0], v10 = arr[y0 * mw + x1]
+  const v01 = arr[y1 * mw + x0], v11 = arr[y1 * mw + x1]
+  return (1 - ty) * ((1 - tx) * v00 + tx * v10) + ty * ((1 - tx) * v01 + tx * v11)
+}
+
 function drawWithBackground(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
-  segmentation: { categoryMask?: { getAsUint8Array(): Uint8Array; width: number; height: number } },
+  segmentation: { confidenceMasks?: Array<{ getAsFloat32Array(): Float32Array; width: number; height: number }> },
   bgColor: string,
   W: number,
   H: number,
@@ -31,33 +40,33 @@ function drawWithBackground(
   oc.drawImage(video, 0, 0, W, H)
   oc.restore()
 
-  // Get video pixel data and segmentation mask
   const videoData = oc.getImageData(0, 0, W, H)
   const pixels = videoData.data
 
-  const mask = segmentation.categoryMask!
-  const maskArr = mask.getAsUint8Array()
-  const maskW = mask.width
-  const maskH = mask.height
+  // confidenceMasks[0] = person confidence (class 0), 1.0 = definitely person
+  const maskImg = segmentation.confidenceMasks![0]
+  const maskArr = maskImg.getAsFloat32Array()
+  const maskW = maskImg.width
+  const maskH = maskImg.height
 
-  // For each canvas pixel: look up the corresponding mask value.
-  // Iterate canvas pixels (not mask pixels) so every pixel is covered.
   const bg = parseCssColor(bgColor)
-  for (let cy = 0; cy < H; cy++) {
-    for (let cx = 0; cx < W; cx++) {
-      // The video was drawn mirrored, so canvas cx=0 is video right edge.
-      // Un-mirror to find the original video x, then scale to mask coords.
-      const videoX = W - 1 - cx
-      const mx = Math.min(maskW - 1, Math.floor((videoX / W) * maskW))
-      const my = Math.min(maskH - 1, Math.floor((cy / H) * maskH))
-      const isMaskBackground = maskArr[my * maskW + mx] !== 0
 
-      if (isMaskBackground) {
+  for (let cy = 0; cy < H; cy++) {
+    // Un-mirror x: canvas left = video right
+    const fy = (cy / H) * maskH
+    for (let cx = 0; cx < W; cx++) {
+      const videoX = W - 1 - cx
+      const fx = (videoX / W) * maskW
+
+      // Bilinear sample gives a smooth gradient at person edges
+      const personConf = sampleBilinear(maskArr, maskW, maskH, fx, fy)
+      const bgAlpha = 1 - personConf
+
+      if (bgAlpha > 0) {
         const pi = (cy * W + cx) * 4
-        pixels[pi]     = bg[0]
-        pixels[pi + 1] = bg[1]
-        pixels[pi + 2] = bg[2]
-        pixels[pi + 3] = 255
+        pixels[pi]     = (pixels[pi]     * personConf + bg[0] * bgAlpha) | 0
+        pixels[pi + 1] = (pixels[pi + 1] * personConf + bg[1] * bgAlpha) | 0
+        pixels[pi + 2] = (pixels[pi + 2] * personConf + bg[2] * bgAlpha) | 0
       }
     }
   }
@@ -120,7 +129,7 @@ export function renderFrame(
   handResult: HandLandmarkerResult | null,
   debugMode: boolean,
   grabbing: Map<number, boolean>,
-  segmentation: ImageSegmenterResult | null,
+  segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
   bgEnabled: boolean,
 ) {
@@ -128,7 +137,7 @@ export function renderFrame(
 
   ctx.clearRect(0, 0, W, H)
 
-  if (bgEnabled && segmentation?.categoryMask) {
+  if (bgEnabled && segmentation?.confidenceMasks?.length) {
     drawWithBackground(ctx, video, segmentation, bgColor, W, H)
   } else {
     // Plain mirrored video

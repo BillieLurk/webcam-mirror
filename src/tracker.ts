@@ -64,8 +64,8 @@ export class Tracker {
         delegate: 'GPU',
       },
       runningMode: 'VIDEO',
-      outputCategoryMask: true,
-      outputConfidenceMasks: false,
+      outputCategoryMask: false,
+      outputConfidenceMasks: true,
     })
   }
 
