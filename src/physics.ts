@@ -39,7 +39,7 @@ export class PhysicsScene {
   constructor(width: number, height: number) {
     this.width = width
     this.height = height
-    this.engine = Engine.create({ gravity: { x: 0, y: 0.1 } })
+    this.engine = Engine.create({ gravity: { x: 0, y: 0 } })
     this.buildWalls()
   }
 
@@ -71,10 +71,10 @@ export class PhysicsScene {
     const r = 30 + Math.random() * 22
 
     const opts: Matter.IBodyDefinition = {
-      restitution: 0.55,
-      frictionAir: 0.025,
-      friction: 0.05,
-      density: 0.001,
+      restitution: 0.8,
+      frictionAir: 0.012,  // slow damping — drifts to rest like a balloon
+      friction: 0.0,
+      density: 0.0004,
     }
 
     let body: Matter.Body
@@ -92,10 +92,8 @@ export class PhysicsScene {
       shape = 'polygon'
     }
 
-    Body.setVelocity(body, {
-      x: (Math.random() - 0.5) * 2,
-      y: (Math.random() - 0.5) * 2,
-    })
+    // No initial velocity — balloons just hover until disturbed
+    Body.setVelocity(body, { x: 0, y: 0 })
 
     const obj: FloatingObject = { body, shape, color, label, radius: r, grabbed: false }
     this.floatingObjects.push(obj)
@@ -209,5 +207,15 @@ export class PhysicsScene {
 
   step(dt: number) {
     Engine.update(this.engine, dt)
+    // Cap speed so objects can't be launched off-screen
+    const MAX_SPEED = 14
+    for (const obj of this.floatingObjects) {
+      if (obj.grabbed) continue
+      const { x, y } = obj.body.velocity
+      const speed = Math.hypot(x, y)
+      if (speed > MAX_SPEED) {
+        Body.setVelocity(obj.body, { x: x * MAX_SPEED / speed, y: y * MAX_SPEED / speed })
+      }
+    }
   }
 }
