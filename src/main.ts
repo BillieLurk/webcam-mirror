@@ -39,7 +39,7 @@ async function main() {
   const depthIPInput = document.getElementById('depthIP') as HTMLInputElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
-  let debugMode = true
+  let debugMode = false
   let bgEnabled = false
   let bgColor = '#00ff88'
   let lastPose: PoseLandmarkerResult | null = null
@@ -113,14 +113,14 @@ async function main() {
     return { bodyW, bodyH, drawW, drawH, drawX, drawY }
   }
 
-  let productIndex = 0
+  const MAX_OBJECTS = 5
+
   function spawnNext() {
-    const key = PRODUCT_FILES[productIndex % PRODUCT_FILES.length]
-    productIndex++
+    const key = PRODUCT_FILES[Math.floor(Math.random() * PRODUCT_FILES.length)]
     const { bodyW, bodyH, drawW, drawH, drawX, drawY } = computeDrawParams(key)
     physics.spawnObject(key, bodyW, bodyH, drawW, drawH, drawX, drawY)
   }
-  for (let i = 0; i < PRODUCT_FILES.length; i++) spawnNext()
+  for (let i = 0; i < MAX_OBJECTS; i++) spawnNext()
 
   // MediaPipe
   const tracker = new Tracker()
@@ -140,14 +140,23 @@ async function main() {
     hintEl.style.opacity = '0'
   }, 8000)
 
-  // UI
-  debugBtn.classList.add('active')
+  // UI — menu hidden by default, toggled via the settings button
+  const uiEl = document.getElementById('ui') as HTMLDivElement
+  const menuBtn = document.getElementById('menuBtn') as HTMLButtonElement
+  let menuOpen = false
+  menuBtn.addEventListener('click', () => {
+    menuOpen = !menuOpen
+    uiEl.style.display = menuOpen ? 'flex' : 'none'
+    menuBtn.classList.toggle('active', menuOpen)
+  })
+
   debugBtn.addEventListener('click', () => {
     debugMode = !debugMode
     debugBtn.classList.toggle('active', debugMode)
   })
   addBtn.addEventListener('click', () => {
-    for (let i = 0; i < 4; i++) spawnNext()
+    const toAdd = MAX_OBJECTS - physics.floatingObjects.length
+    for (let i = 0; i < toAdd; i++) spawnNext()
   })
   clearBtn.addEventListener('click', () => physics.clearObjects())
   bgBtn.addEventListener('click', () => {
@@ -313,6 +322,26 @@ async function main() {
 
     // --- Step physics ---
     physics.step(dt)
+
+    // --- Lifecycle: remove dead objects, maintain MAX_OBJECTS ---
+    physics.collectDeadObjects()
+    while (physics.floatingObjects.length < MAX_OBJECTS) spawnNext()
+
+    // --- Torso depenetration (after step so collision resolution can't undo it) ---
+    if (lastPose && lastPose.landmarks.length > 0) {
+      const lms = lastPose.landmarks[0]
+      const s11 = lms[11], s12 = lms[12], h23 = lms[23], h24 = lms[24]
+      if (s11 && s12 && h23 && h24 &&
+          (s11.visibility ?? 1) >= 0.3 && (s12.visibility ?? 1) >= 0.3 &&
+          (h23.visibility ?? 1) >= 0.3 && (h24.visibility ?? 1) >= 0.3) {
+        physics.pushFromTorso([
+          { x: (1 - s11.x) * canvas.width, y: s11.y * canvas.height },
+          { x: (1 - s12.x) * canvas.width, y: s12.y * canvas.height },
+          { x: (1 - h24.x) * canvas.width, y: h24.y * canvas.height },
+          { x: (1 - h23.x) * canvas.width, y: h23.y * canvas.height },
+        ])
+      }
+    }
 
     // --- Render ---
     renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5)

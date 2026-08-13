@@ -282,8 +282,10 @@ function drawObject(
   const info = images.get(obj.imageKey)
 
   ctx.save()
+  ctx.globalAlpha = obj.alpha
   ctx.translate(x, y)
   ctx.rotate(angle)
+  ctx.scale(obj.scale, obj.scale)
 
   const ringR = Math.max(obj.drawW, obj.drawH) / 2 + 8
 

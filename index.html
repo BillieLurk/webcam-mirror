@@ -24,7 +24,7 @@
 
     #ui {
       position: fixed;
-      top: 16px;
+      top: 56px;
       right: 16px;
       display: flex;
       flex-direction: column;
@@ -145,7 +145,32 @@
 <body>
   <canvas id="canvas"></canvas>
 
-  <div id="ui">
+  <div style="
+    position: fixed;
+    left: 0; top: 0;
+    width: 88px; height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none;
+    z-index: 5;
+    overflow: visible;
+  ">
+    <img
+      src="/assets/Black logo.png"
+      style="
+        width: 560px;
+        height: 64px;
+        object-fit: contain;
+        transform: rotate(-90deg);
+        flex-shrink: 0;
+      "
+    />
+  </div>
+
+  <button id="menuBtn" class="btn" style="
+    position: fixed; top: 16px; right: 16px; z-index: 11;
+  ">⚙</button>
+
+  <div id="ui" style="display:none;">
     <button class="btn" id="debugBtn">Debug Skeleton</button>
     <button class="btn" id="addBtn">+ Add Objects</button>
     <button class="btn" id="clearBtn">Clear Objects</button>
