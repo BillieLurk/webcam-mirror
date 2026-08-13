@@ -8,6 +8,9 @@ import { detectFist, getPalmCenter } from './tracker'
 let offVideo: OffscreenCanvas | null = null
 let offVideoCtx: OffscreenCanvasRenderingContext2D | null = null
 
+// Temporal smoothing buffer for depth background alpha — reduces flicker between frames
+let prevDepthAlpha: Float32Array | null = null
+
 function ensureOffscreen(w: number, h: number) {
   if (!offVideo || offVideo.width !== w || offVideo.height !== h) {
     offVideo = new OffscreenCanvas(w, h)
@@ -105,9 +108,14 @@ function drawWithDepth(
 
   const { depthData, depthWidth: dw, depthHeight: dh } = frame
 
-  // Depth threshold: pixels beyond this distance (metres) become background.
-  // A good starting value for a person standing ~1-2m away is 2.5m.
-  const THRESHOLD = 2.5
+  const THRESHOLD = 2.5  // metres — person closer than this is kept
+  const EDGE      = 0.3  // soft transition zone width (metres either side of threshold)
+  const TEMPORAL  = 0.55 // how much of the previous frame's alpha to blend in (0=none, higher=smoother)
+
+  const numPixels = W * H
+  if (!prevDepthAlpha || prevDepthAlpha.length !== numPixels) {
+    prevDepthAlpha = new Float32Array(numPixels)
+  }
 
   for (let cy = 0; cy < H; cy++) {
     const fy = (cy / H) * dh
@@ -115,15 +123,30 @@ function drawWithDepth(
       const fx = (cx / W) * dw
       const depth = sampleBilinear(depthData, dw, dh, fx, fy)
 
-      // depth === 0 means "no data" from sensor — treat as background
-      const isBackground = depth === 0 || depth > THRESHOLD
+      // Raw background alpha: 0 = fully person, 1 = fully background
+      let raw: number
+      if (depth === 0) {
+        raw = 1  // no sensor data → background
+      } else if (depth < THRESHOLD - EDGE) {
+        raw = 0  // clearly in front
+      } else if (depth > THRESHOLD + EDGE) {
+        raw = 1  // clearly behind
+      } else {
+        // Smooth S-curve across the edge zone
+        const t = (depth - (THRESHOLD - EDGE)) / (2 * EDGE)
+        raw = t * t * (3 - 2 * t)  // smoothstep
+      }
 
-      if (isBackground) {
-        const pi = (cy * W + cx) * 4
-        pixels[pi]     = bg[0]
-        pixels[pi + 1] = bg[1]
-        pixels[pi + 2] = bg[2]
-        pixels[pi + 3] = 255
+      // Temporal blend: mix with previous frame to suppress flicker
+      const pi = cy * W + cx
+      const alpha = prevDepthAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
+      prevDepthAlpha[pi] = alpha
+
+      if (alpha > 0.01) {
+        const idx = pi * 4
+        pixels[idx]     = ((pixels[idx]     * (1 - alpha)) + bg[0] * alpha) | 0
+        pixels[idx + 1] = ((pixels[idx + 1] * (1 - alpha)) + bg[1] * alpha) | 0
+        pixels[idx + 2] = ((pixels[idx + 2] * (1 - alpha)) + bg[2] * alpha) | 0
       }
     }
   }
