@@ -4,18 +4,17 @@ const { Engine, World, Bodies, Body, Composite } = Matter
 
 export interface FloatingObject {
   body: Matter.Body
-  shape: 'circle' | 'rect' | 'polygon'
-  color: string
-  label: string
+  imageKey: string
+  /** Full image draw dimensions in local (body-centered) space. */
+  drawW: number
+  drawH: number
+  /** Image origin offset so that the content center aligns with body center (0,0). */
+  drawX: number
+  drawY: number
+  /** Half-diagonal of physics body — used for grab-radius detection. */
   radius: number
   grabbed: boolean
 }
-
-const COLORS = [
-  '#ff6b9d', '#c77dff', '#4cc9f0', '#f77f00',
-  '#06ffa5', '#ffbe0b', '#fb5607', '#8338ec', '#3a86ff',
-]
-const LABELS = ['⭐', '🌙', '🔮', '💎', '🎈', '🌟', '🎯', '🪄', '🎪', '🎭', '🌈', '⚡', '🦋', '🍀']
 
 interface GrabState {
   object: FloatingObject
@@ -25,6 +24,8 @@ interface GrabState {
   prevPy: number
   grabHandAngle: number
   grabObjectAngle: number
+  /** Rolling hand velocity history for throw calculation (last N frames). */
+  velHistory: { x: number; y: number }[]
 }
 
 export class PhysicsScene {
@@ -62,40 +63,33 @@ export class PhysicsScene {
     this.buildWalls()
   }
 
-  spawnObject(x?: number, y?: number): FloatingObject {
+  spawnObject(
+    imageKey: string,
+    bodyW: number,
+    bodyH: number,
+    drawW: number,
+    drawH: number,
+    drawX: number,
+    drawY: number,
+    x?: number,
+    y?: number,
+  ): FloatingObject {
     const cx = x ?? 80 + Math.random() * (this.width - 160)
     const cy = y ?? 80 + Math.random() * (this.height * 0.55)
-    const t = Math.floor(Math.random() * 3)
-    const color = COLORS[Math.floor(Math.random() * COLORS.length)]
-    const label = LABELS[Math.floor(Math.random() * LABELS.length)]
-    const r = 30 + Math.random() * 22
 
     const opts: Matter.IBodyDefinition = {
       restitution: 0.8,
-      frictionAir: 0.012,  // slow damping — drifts to rest like a balloon
+      frictionAir: 0.012,
       friction: 0.0,
       density: 0.0004,
+      collisionFilter: { category: 0x0002, group: 0, mask: 0xFFFFFFFF },
     }
 
-    let body: Matter.Body
-    let shape: FloatingObject['shape']
-
-    if (t === 0) {
-      body = Bodies.circle(cx, cy, r, opts)
-      shape = 'circle'
-    } else if (t === 1) {
-      body = Bodies.rectangle(cx, cy, r * 2.2, r * 2.2, opts)
-      shape = 'rect'
-    } else {
-      const sides = 5 + Math.floor(Math.random() * 3) // 5, 6, or 7
-      body = Bodies.polygon(cx, cy, sides, r, opts)
-      shape = 'polygon'
-    }
-
-    // No initial velocity — balloons just hover until disturbed
+    const body = Bodies.rectangle(cx, cy, bodyW, bodyH, opts)
     Body.setVelocity(body, { x: 0, y: 0 })
 
-    const obj: FloatingObject = { body, shape, color, label, radius: r, grabbed: false }
+    const radius = Math.hypot(bodyW, bodyH) / 2
+    const obj: FloatingObject = { body, imageKey, drawW, drawH, drawX, drawY, radius, grabbed: false }
     this.floatingObjects.push(obj)
     Composite.add(this.engine.world, body)
     return obj
@@ -118,7 +112,7 @@ export class PhysicsScene {
         restitution: 0.4,
         friction: 0,
         frictionAir: 0,
-        collisionFilter: { mask: collides ? 0xFFFFFFFF : 0 },
+        collisionFilter: { category: 0x0004, group: 0, mask: collides ? 0xFFFFFFFF : 0 },
       })
       this.landmarkBodies.set(id, body)
       Composite.add(this.engine.world, body)
@@ -134,6 +128,22 @@ export class PhysicsScene {
   parkLandmark(id: string) {
     const body = this.landmarkBodies.get(id)
     if (body) Body.setPosition(body, { x: -600, y: -600 })
+  }
+
+  // ---- Hover detection ----
+
+  getHoverObject(handIdx: number, px: number, py: number, reach: number): FloatingObject | null {
+    if (this.grabMap.has(handIdx)) return null
+    let best: FloatingObject | null = null
+    let bestDist = reach
+    for (const obj of this.floatingObjects) {
+      if (obj.grabbed) continue
+      const dx = obj.body.position.x - px
+      const dy = obj.body.position.y - py
+      const d = Math.sqrt(dx * dx + dy * dy)
+      if (d < bestDist) { best = obj; bestDist = d }
+    }
+    return best
   }
 
   // ---- Grab mechanics ----
@@ -154,7 +164,8 @@ export class PhysicsScene {
     if (best) {
       best.grabbed = true
       // Disable collisions while held — must include category or Matter.js wipes it
-      Body.set(best.body, { collisionFilter: { category: 0x0001, group: 0, mask: 0 } })
+      // While grabbed: collide only with other floating objects (0x0002), not landmarks or walls
+      Body.set(best.body, { collisionFilter: { category: 0x0002, group: 0, mask: 0x0002 } })
       this.grabMap.set(handIdx, {
         object: best,
         offsetX: 0,
@@ -163,6 +174,7 @@ export class PhysicsScene {
         prevPy: py,
         grabHandAngle: handAngle,
         grabObjectAngle: best.body.angle,
+        velHistory: [],
       })
     }
   }
@@ -182,21 +194,40 @@ export class PhysicsScene {
     const currentAngle = state.object.body.angle
     Body.setAngle(state.object.body, currentAngle + (targetAngle - currentAngle) * LERP)
     Body.setAngularVelocity(state.object.body, 0)
+    // Record hand velocity for throw calculation
+    state.velHistory.push({ x: px - state.prevPx, y: py - state.prevPy })
+    if (state.velHistory.length > 6) state.velHistory.shift()
+
     state.prevPx = px
     state.prevPy = py
   }
 
-  releaseGrab(handIdx: number, px: number, py: number) {
+  releaseGrab(handIdx: number) {
     const state = this.grabMap.get(handIdx)
     if (state) {
       state.object.grabbed = false
-      Body.set(state.object.body, { collisionFilter: { category: 0x0001, group: 0, mask: 0xFFFFFFFF } })
-      // Small throw from last frame movement, capped so it can't leave the screen
-      const clamp = (v: number, max: number) => Math.max(-max, Math.min(max, v))
-      Body.setVelocity(state.object.body, {
-        x: clamp((px - state.prevPx) * 1.5, 6),
-        y: clamp((py - state.prevPy) * 1.5, 6),
-      })
+      Body.set(state.object.body, { collisionFilter: { category: 0x0002, group: 0, mask: 0xFFFFFFFF } })
+
+      // Average recent hand velocities for a stable throw direction.
+      // Weight recent frames more heavily (index 0 = oldest).
+      const hist = state.velHistory
+      if (hist.length > 0) {
+        let wx = 0, wy = 0, totalW = 0
+        for (let i = 0; i < hist.length; i++) {
+          const w = i + 1  // later frames have higher weight
+          wx += hist[i].x * w
+          wy += hist[i].y * w
+          totalW += w
+        }
+        const clamp = (v: number, max: number) => Math.max(-max, Math.min(max, v))
+        Body.setVelocity(state.object.body, {
+          x: clamp((wx / totalW) * 3.5, 30),
+          y: clamp((wy / totalW) * 3.5, 30),
+        })
+      } else {
+        Body.setVelocity(state.object.body, { x: 0, y: 0 })
+      }
+
       this.grabMap.delete(handIdx)
     }
   }
@@ -208,7 +239,7 @@ export class PhysicsScene {
   step(dt: number) {
     Engine.update(this.engine, dt)
     // Cap speed so objects can't be launched off-screen
-    const MAX_SPEED = 14
+    const MAX_SPEED = 30
     for (const obj of this.floatingObjects) {
       if (obj.grabbed) continue
       const { x, y } = obj.body.velocity

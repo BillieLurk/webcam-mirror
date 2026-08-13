@@ -1,6 +1,7 @@
 import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 import type { FloatingObject } from './physics'
 import type { DepthFrame } from './depth-receiver'
+import type { ImageInfo } from './assets'
 import { detectFist, getPalmCenter } from './tracker'
 
 // Offscreen canvases for background replacement compositing, lazily created
@@ -161,6 +162,16 @@ const PUSHING_CONNECTIONS = new Set([
   '23,25', '25,27', '24,26', '26,28',
 ])
 
+// Limb pairs that have intermediate collider bodies (matches main.ts LIMB_PAIRS)
+const LIMB_PAIRS: [number, number][] = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [24, 26], [26, 28],
+]
+const LIMB_STEPS = [0.25, 0.5, 0.75]
+// Physics body radius matching main.ts BODY_RADIUS
+const COLLIDER_RADIUS = 26
+
 // Joints that are physics collision bodies
 const PUSHING_JOINTS = new Set([0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28])
 
@@ -185,6 +196,8 @@ export function renderFrame(
   handResult: HandLandmarkerResult | null,
   debugMode: boolean,
   grabbing: Map<number, boolean>,
+  hoverObjects: Set<FloatingObject>,
+  images: Map<string, ImageInfo>,
   segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
   bgEnabled: boolean,
@@ -216,7 +229,7 @@ export function renderFrame(
 
   // Physics objects
   for (const obj of objects) {
-    drawObject(ctx, obj)
+    drawObject(ctx, obj, images, hoverObjects.has(obj))
   }
 
   // Debug: pose skeleton
@@ -235,70 +248,53 @@ export function renderFrame(
   }
 }
 
-function drawObject(ctx: CanvasRenderingContext2D, obj: FloatingObject) {
+function drawObject(
+  ctx: CanvasRenderingContext2D,
+  obj: FloatingObject,
+  images: Map<string, ImageInfo>,
+  hovered = false,
+) {
   const { x, y } = obj.body.position
   const angle = obj.body.angle
-  const glow = obj.grabbed ? '#ffffff' : obj.color
-  const alpha = obj.grabbed ? 'ee' : 'cc'
-
-  if (obj.shape === 'polygon') {
-    // Use raw world-space vertices
-    ctx.save()
-    ctx.shadowBlur = obj.grabbed ? 40 : 22
-    ctx.shadowColor = glow
-    ctx.fillStyle = obj.color + alpha
-    ctx.strokeStyle = glow
-    ctx.lineWidth = obj.grabbed ? 3 : 2
-
-    const verts = obj.body.vertices
-    ctx.beginPath()
-    ctx.moveTo(verts[0].x, verts[0].y)
-    for (let i = 1; i < verts.length; i++) ctx.lineTo(verts[i].x, verts[i].y)
-    ctx.closePath()
-    ctx.fill()
-    ctx.stroke()
-    ctx.shadowBlur = 0
-    ctx.restore()
-
-    // Label centered on polygon
-    ctx.save()
-    ctx.font = `${obj.radius * 0.85}px serif`
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    ctx.fillText(obj.label, x, y)
-    ctx.restore()
-    return
-  }
+  const info = images.get(obj.imageKey)
 
   ctx.save()
   ctx.translate(x, y)
   ctx.rotate(angle)
-  ctx.shadowBlur = obj.grabbed ? 40 : 22
-  ctx.shadowColor = glow
-  ctx.fillStyle = obj.color + alpha
-  ctx.strokeStyle = glow
-  ctx.lineWidth = obj.grabbed ? 3 : 2
 
-  if (obj.shape === 'circle') {
+  const ringR = Math.max(obj.drawW, obj.drawH) / 2 + 8
+
+  // Grabbed highlight ring
+  if (obj.grabbed) {
     ctx.beginPath()
-    ctx.arc(0, 0, obj.radius, 0, Math.PI * 2)
-    ctx.fill()
+    ctx.arc(0, 0, ringR, 0, Math.PI * 2)
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+    ctx.lineWidth = 3
+    ctx.shadowBlur = 24
+    ctx.shadowColor = '#ffffff'
     ctx.stroke()
-  } else {
-    // rect
-    const s = obj.radius * 2.2
+    ctx.shadowBlur = 0
+  } else if (hovered) {
+    // Hover highlight — softer, dashed ring
     ctx.beginPath()
-    ctx.roundRect(-s / 2, -s / 2, s, s, 10)
-    ctx.fill()
+    ctx.arc(0, 0, ringR, 0, Math.PI * 2)
+    ctx.setLineDash([6, 5])
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'
+    ctx.lineWidth = 2
+    ctx.shadowBlur = 12
+    ctx.shadowColor = 'rgba(255,255,255,0.6)'
     ctx.stroke()
+    ctx.setLineDash([])
+    ctx.shadowBlur = 0
   }
 
-  ctx.shadowBlur = 0
-  ctx.font = `${obj.radius * 0.85}px serif`
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
-  ctx.fillStyle = 'rgba(255,255,255,0.9)'
-  ctx.fillText(obj.label, 0, 0)
+  if (info) {
+    // drawX/drawY are pre-computed so content center sits at local (0,0)
+    ctx.drawImage(info.el, obj.drawX, obj.drawY, obj.drawW, obj.drawH)
+  } else {
+    ctx.fillStyle = 'rgba(200,200,200,0.4)'
+    ctx.fillRect(-50, -50, 100, 100)
+  }
 
   ctx.restore()
 }
@@ -359,6 +355,41 @@ function drawPoseSkeleton(
     ctx.shadowColor = '#4cc9f0'
     ctx.fillStyle = pushing ? '#4cc9f0' : 'rgba(255,255,255,0.3)'
     ctx.fill()
+    ctx.shadowBlur = 0
+  }
+
+  // Intermediate limb colliders at 25/50/75% along each pushing segment
+  ctx.strokeStyle = 'rgba(76,201,240,0.4)'
+  ctx.lineWidth = 1.5
+  ctx.shadowBlur = 0
+  for (const [a, b] of LIMB_PAIRS) {
+    const lmA = landmarks[a], lmB = landmarks[b]
+    if (!lmA || !lmB || (lmA.visibility ?? 1) < 0.25 || (lmB.visibility ?? 1) < 0.25) continue
+    const [ax, ay] = lm2c(lmA, W, H)
+    const [bx, by] = lm2c(lmB, W, H)
+    for (const t of LIMB_STEPS) {
+      ctx.beginPath()
+      ctx.arc(ax + (bx - ax) * t, ay + (by - ay) * t, COLLIDER_RADIUS, 0, Math.PI * 2)
+      ctx.stroke()
+    }
+  }
+
+  // Head collider — circle sized to 45% of shoulder width, matching physics
+  const head = landmarks[0], lShoulder = landmarks[11], rShoulder = landmarks[12]
+  if (head && (head.visibility ?? 1) >= 0.25 && lShoulder && rShoulder &&
+      (lShoulder.visibility ?? 1) >= 0.25 && (rShoulder.visibility ?? 1) >= 0.25) {
+    const [hx, hy] = lm2c(head, W, H)
+    const [lsx, lsy] = lm2c(lShoulder, W, H)
+    const [rsx, rsy] = lm2c(rShoulder, W, H)
+    const shoulderDist = Math.hypot(lsx - rsx, lsy - rsy)
+    const headR = shoulderDist * 0.28
+    ctx.beginPath()
+    ctx.arc(hx, hy - headR * 0.8, headR, 0, Math.PI * 2)
+    ctx.strokeStyle = 'rgba(76,201,240,0.5)'
+    ctx.lineWidth = 2
+    ctx.shadowBlur = 10
+    ctx.shadowColor = '#4cc9f0'
+    ctx.stroke()
     ctx.shadowBlur = 0
   }
 

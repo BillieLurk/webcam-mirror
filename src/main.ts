@@ -2,6 +2,7 @@ import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
 import { DepthReceiver } from './depth-receiver'
+import { PRODUCT_FILES, preloadImages, getCategoryScale } from './assets'
 import type { DepthFrame } from './depth-receiver'
 import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
@@ -87,8 +88,39 @@ async function main() {
   resize()
   window.addEventListener('resize', resize)
 
-  // Spawn initial floating objects
-  for (let i = 0; i < 10; i++) physics.spawnObject()
+  // Preload product images and spawn one of each
+  const images = await preloadImages()
+
+  const TARGET_SIZE = 150 // target px for the largest content dimension
+
+  function computeDrawParams(key: string) {
+    const info = images.get(key)
+    if (!info) return { bodyW: TARGET_SIZE, bodyH: TARGET_SIZE, drawW: TARGET_SIZE, drawH: TARGET_SIZE, drawX: -TARGET_SIZE / 2, drawY: -TARGET_SIZE / 2 }
+    const { el, contentX, contentY, contentW, contentH } = info
+    const imgW = el.naturalWidth, imgH = el.naturalHeight
+    const contentPxW = contentW * imgW
+    const contentPxH = contentH * imgH
+    const scale = (TARGET_SIZE * getCategoryScale(key)) / Math.max(contentPxW, contentPxH)
+    const drawW = imgW * scale
+    const drawH = imgH * scale
+    const bodyW = contentPxW * scale
+    const bodyH = contentPxH * scale
+    // Offset image so its content center lands at local (0,0)
+    const ccx = contentX + contentW / 2
+    const ccy = contentY + contentH / 2
+    const drawX = -ccx * drawW
+    const drawY = -ccy * drawH
+    return { bodyW, bodyH, drawW, drawH, drawX, drawY }
+  }
+
+  let productIndex = 0
+  function spawnNext() {
+    const key = PRODUCT_FILES[productIndex % PRODUCT_FILES.length]
+    productIndex++
+    const { bodyW, bodyH, drawW, drawH, drawX, drawY } = computeDrawParams(key)
+    physics.spawnObject(key, bodyW, bodyH, drawW, drawH, drawX, drawY)
+  }
+  for (let i = 0; i < PRODUCT_FILES.length; i++) spawnNext()
 
   // MediaPipe
   const tracker = new Tracker()
@@ -115,7 +147,7 @@ async function main() {
     debugBtn.classList.toggle('active', debugMode)
   })
   addBtn.addEventListener('click', () => {
-    for (let i = 0; i < 4; i++) physics.spawnObject()
+    for (let i = 0; i < 4; i++) spawnNext()
   })
   clearBtn.addEventListener('click', () => physics.clearObjects())
   bgBtn.addEventListener('click', () => {
@@ -153,14 +185,41 @@ async function main() {
     if (lastPose && lastPose.landmarks.length > 0) {
       const lms = lastPose.landmarks[0]
 
+      // Compute shoulder width in screen space — used as distance proxy for head radius.
+      // Wider shoulders = closer to camera = bigger head collider.
+      const ls = lms[11], rs = lms[12]
+      const shoulderPxDist = (ls && rs && (ls.visibility ?? 1) >= 0.3 && (rs.visibility ?? 1) >= 0.3)
+        ? Math.hypot((1 - ls.x) * canvas.width - (1 - rs.x) * canvas.width, ls.y * canvas.height - rs.y * canvas.height)
+        : 0
+      // Head radius ≈ 28% of shoulder width; min = BODY_RADIUS
+      const HEAD_RADIUS = shoulderPxDist > 0 ? Math.max(BODY_RADIUS, shoulderPxDist * 0.28) : BODY_RADIUS
+
       // Joint endpoint bodies
+      // Wrist bodies (15=left, 16=right) are placed at 70% from elbow→wrist so
+      // the collider stops short of the actual wrist joint.
+      const WRIST_ELBOW: Record<number, number> = { 15: 13, 16: 14 }
       for (const idx of BODY_INDICES) {
         const lm = lms[idx]
         if (!lm || (lm.visibility ?? 1) < 0.3) {
           physics.parkLandmark(`p${idx}`)
           continue
         }
-        physics.updateLandmark(`p${idx}`, (1 - lm.x) * canvas.width, lm.y * canvas.height, BODY_RADIUS)
+        let cx = (1 - lm.x) * canvas.width
+        let cy = lm.y * canvas.height
+        const elbowIdx = WRIST_ELBOW[idx]
+        if (elbowIdx !== undefined) {
+          const elbow = lms[elbowIdx]
+          if (elbow && (elbow.visibility ?? 1) >= 0.3) {
+            const ex = (1 - elbow.x) * canvas.width
+            const ey = elbow.y * canvas.height
+            cx = ex + (cx - ex) * 0.7
+            cy = ey + (cy - ey) * 0.7
+          }
+        }
+        const radius = idx === 0 ? HEAD_RADIUS : BODY_RADIUS
+        // Shift head collider up from nose so it centers on the skull
+        const finalCy = idx === 0 ? cy - HEAD_RADIUS * 0.8 : cy
+        physics.updateLandmark(`p${idx}`, cx, finalCy, radius)
       }
 
       // Bodies evenly spaced along each limb — 3 per segment fills the gaps between joints
@@ -193,7 +252,7 @@ async function main() {
       // Release grabs for disappeared hands (no position — throw with zero velocity)
       for (const [i] of pinchWas) {
         if (i >= count) {
-          physics.releaseGrab(i, 0, 0)
+          physics.releaseGrab(i)
           pinchWas.delete(i)
         }
       }
@@ -224,18 +283,31 @@ async function main() {
         } else if (pinching && wasPinching) {
           physics.moveGrab(i, px, py, handAngle)
         } else if (!pinching && wasPinching) {
-          physics.releaseGrab(i, px, py)
+          physics.releaseGrab(i)
         }
 
         pinchWas.set(i, pinching)
       }
     }
 
-    // Build grab map for renderer
+    // Build grab map and hover set for renderer
     const grabbing = new Map<number, boolean>()
+    const hoverObjects = new Set<import('./physics').FloatingObject>()
     if (lastHands) {
       for (let i = 0; i < lastHands.landmarks.length; i++) {
         grabbing.set(i, physics.isGrabbing(i))
+        if (!physics.isGrabbing(i)) {
+          const lms = lastHands.landmarks[i]
+          const palm = getPalmCenter(lms)
+          const px = (1 - palm.x) * canvas.width
+          const py = palm.y * canvas.height
+          const wrist = lms[0]
+          const wristX = (1 - wrist.x) * canvas.width
+          const wristY = wrist.y * canvas.height
+          const handReach = Math.hypot(wristX - px, wristY - py)
+          const hovered = physics.getHoverObject(i, px, py, handReach)
+          if (hovered) hoverObjects.add(hovered)
+        }
       }
     }
 
@@ -243,7 +315,7 @@ async function main() {
     physics.step(dt)
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5)
 
     requestAnimationFrame(loop)
   }
