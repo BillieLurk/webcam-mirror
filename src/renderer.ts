@@ -487,11 +487,26 @@ function drawHandOverlay(
   const px = (1 - palm.x) * W
   const py = palm.y * H
 
+  // Reach radius: wrist → palm center (same calc as main.ts)
+  const wrist = landmarks[0]
+  const wx = (1 - wrist.x) * W
+  const wy = wrist.y * H
+  const reach = Math.hypot(wx - px, wy - py)
+
   if (isFist || isGrabbing) {
     const color = isGrabbing ? '#06ffa5' : '#ffd60a'
     const r = isGrabbing ? 22 : 16
 
     ctx.save()
+    // Reach zone ring — brighter when fist closed
+    ctx.beginPath()
+    ctx.arc(px, py, reach, 0, Math.PI * 2)
+    ctx.setLineDash([5, 7])
+    ctx.strokeStyle = isGrabbing ? 'rgba(6,255,165,0.35)' : 'rgba(255,214,10,0.35)'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    ctx.setLineDash([])
+    // Centre dot + inner ring
     ctx.beginPath()
     ctx.arc(px, py, r, 0, Math.PI * 2)
     ctx.strokeStyle = color
@@ -507,9 +522,18 @@ function drawHandOverlay(
     ctx.restore()
   } else {
     ctx.save()
+    // Reach zone ring — always visible so user knows their interaction area
     ctx.beginPath()
-    ctx.arc(px, py, 7, 0, Math.PI * 2)
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)'
+    ctx.arc(px, py, reach, 0, Math.PI * 2)
+    ctx.setLineDash([5, 7])
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    ctx.setLineDash([])
+    // Small centre dot
+    ctx.beginPath()
+    ctx.arc(px, py, 5, 0, Math.PI * 2)
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)'
     ctx.lineWidth = 1.5
     ctx.stroke()
     ctx.restore()

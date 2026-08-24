@@ -373,7 +373,7 @@ async function main() {
           const wristX = (1 - wrist.x) * canvas.width
           const wristY = wrist.y * canvas.height
           const handReach = Math.hypot(wristX - px, wristY - py)
-          const hovered = physics.getHoverObject(i, px, py, handReach)
+          const hovered = physics.getHoverObject(i, px, py, handReach * 1.8)
           if (hovered) hoverObjects.add(hovered)
         }
       }
