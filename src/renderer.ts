@@ -373,7 +373,7 @@ function drawDescriptionCard(ctx: CanvasRenderingContext2D, obj: FloatingObject,
   const ease = p * p * (3 - 2 * p)  // smoothstep
 
   const CARD_W = 270
-  const CARD_H = info.howToUse ? 112 : 70
+  const CARD_H = info.howToUse ? 135 : 70
   const PAD_X = 14
   const GAP = obj.drawW / 2 + 18
   const T = -CARD_H / 2  // top edge in card space
