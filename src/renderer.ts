@@ -252,7 +252,7 @@ export function renderFrame(
 
   // Physics objects
   for (const obj of objects) {
-    drawObject(ctx, obj, images, hoverObjects.has(obj))
+    drawObject(ctx, obj, images, hoverObjects.has(obj), debugMode)
   }
 
   // Debug: pose skeleton
@@ -276,6 +276,7 @@ function drawObject(
   obj: FloatingObject,
   images: Map<string, ImageInfo>,
   hovered = false,
+  debugMode = false,
 ) {
   const { x, y } = obj.body.position
   const angle = obj.body.angle
@@ -322,6 +323,26 @@ function drawObject(
   }
 
   ctx.restore()
+
+  // Debug label: product name next to hovered object (drawn in screen space, always upright)
+  if (debugMode && hovered && !obj.grabbed) {
+    const { x, y } = obj.body.position
+    const label = obj.imageKey.replace(/\.(png|jpg|jpeg)$/i, '')
+    const padding = { x: 8, y: 5 }
+    ctx.save()
+    ctx.globalAlpha = obj.alpha
+    ctx.font = '12px system-ui, -apple-system, sans-serif'
+    const tw = ctx.measureText(label).width
+    const bx = x + 14
+    const by = y - 10
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'
+    ctx.beginPath()
+    ctx.roundRect(bx - padding.x, by - 14, tw + padding.x * 2, 20, 5)
+    ctx.fill()
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'
+    ctx.fillText(label, bx, by)
+    ctx.restore()
+  }
 }
 
 function drawPoseSkeleton(

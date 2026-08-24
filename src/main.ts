@@ -2,7 +2,7 @@ import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
 import { DepthReceiver } from './depth-receiver'
-import { PRODUCT_FILES, preloadImages, getCategoryScale } from './assets'
+import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG } from './assets'
 import type { DepthFrame } from './depth-receiver'
 import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
@@ -12,6 +12,7 @@ const BODY_RADIUS = 26
 // Limb segment pairs: each gets a midpoint collision body so the full limb pushes objects
 // Pose indices: 11/12=shoulders, 13/14=elbows, 15/16=wrists, 23/24=hips, 25/26=knees, 27/28=ankles
 const LIMB_PAIRS: [number, number][] = [
+  [0, 11], [0, 12],   // neck: nose → shoulders
   [11, 12],           // shoulder bar
   [11, 13],           // left upper arm
   [13, 15],           // left forearm (elbow → wrist)
@@ -113,7 +114,7 @@ async function main() {
     return { bodyW, bodyH, drawW, drawH, drawX, drawY }
   }
 
-  const MAX_OBJECTS = 5
+  let MAX_OBJECTS = 5
 
   function spawnNext() {
     const key = PRODUCT_FILES[Math.floor(Math.random() * PRODUCT_FILES.length)]
@@ -175,8 +176,64 @@ async function main() {
     }
   })
 
+  // --- Tuning panel: category size sliders + max objects ---
+  const tuningPanel = document.getElementById('tuningPanel') as HTMLDivElement
+  const exportBtn = document.getElementById('exportBtn') as HTMLButtonElement
+
+  function makeSliderRow(label: string, value: number, min: number, max: number, step: number, onChange: (v: number) => void) {
+    const row = document.createElement('div')
+    row.className = 'tuning-row'
+    const lbl = document.createElement('label')
+    lbl.textContent = label
+    const slider = document.createElement('input')
+    slider.type = 'range'
+    slider.min = String(min)
+    slider.max = String(max)
+    slider.step = String(step)
+    slider.value = String(value)
+    const val = document.createElement('span')
+    val.className = 'tuning-val'
+    val.textContent = value.toFixed(2)
+    slider.addEventListener('input', () => {
+      const v = parseFloat(slider.value)
+      val.textContent = v.toFixed(2)
+      onChange(v)
+    })
+    row.append(lbl, slider, val)
+    return row
+  }
+
+  // Max objects slider
+  const maxObjSection = document.createElement('div')
+  maxObjSection.className = 'tuning-section-label'
+  maxObjSection.textContent = 'Max Objects'
+  tuningPanel.append(maxObjSection)
+  tuningPanel.append(makeSliderRow('Count', MAX_OBJECTS, 1, 20, 1, v => { MAX_OBJECTS = v }))
+
+  // Category scale sliders
+  const sizeSection = document.createElement('div')
+  sizeSection.className = 'tuning-section-label'
+  sizeSection.textContent = 'Category Sizes'
+  tuningPanel.append(sizeSection)
+  for (const cat of Object.keys(SCALE_CONFIG)) {
+    tuningPanel.append(makeSliderRow(cat, SCALE_CONFIG[cat], 0.3, 3.0, 0.05, v => { SCALE_CONFIG[cat] = v }))
+  }
+
+  exportBtn.addEventListener('click', () => {
+    const config = { maxObjects: MAX_OBJECTS, scales: { ...SCALE_CONFIG } }
+    const json = JSON.stringify(config, null, 2)
+    navigator.clipboard.writeText(json).then(() => {
+      exportBtn.textContent = 'Copied!'
+      setTimeout(() => { exportBtn.textContent = 'Export Config' }, 1800)
+    })
+  })
+
   // Per-hand pinch tracking
   const pinchWas = new Map<number, boolean>()
+
+  // Reuse these each frame to avoid per-frame allocations
+  const grabbing = new Map<number, boolean>()
+  const hoverObjects = new Set<import('./physics').FloatingObject>()
 
   function loop(ts: number) {
     const dt = Math.min(ts - prevTimestamp, 50)
@@ -185,6 +242,8 @@ async function main() {
     // --- Tracking ---
     const result = tracker.detect(video, ts)
     if (result) {
+      // Release WebGL textures held by previous segmentation masks
+      lastSeg?.confidenceMasks?.forEach(m => m.close())
       lastPose = result.pose
       lastHands = result.hands
       lastSeg = result.segmentation
@@ -299,9 +358,9 @@ async function main() {
       }
     }
 
-    // Build grab map and hover set for renderer
-    const grabbing = new Map<number, boolean>()
-    const hoverObjects = new Set<import('./physics').FloatingObject>()
+    // Build grab map and hover set for renderer (reuse pre-allocated collections)
+    grabbing.clear()
+    hoverObjects.clear()
     if (lastHands) {
       for (let i = 0; i < lastHands.landmarks.length; i++) {
         grabbing.set(i, physics.isGrabbing(i))
@@ -327,10 +386,12 @@ async function main() {
     physics.collectDeadObjects()
     while (physics.floatingObjects.length < MAX_OBJECTS) spawnNext()
 
-    // --- Torso depenetration (after step so collision resolution can't undo it) ---
+    // --- Body depenetration (after step so collision resolution can't undo it) ---
     if (lastPose && lastPose.landmarks.length > 0) {
       const lms = lastPose.landmarks[0]
-      const s11 = lms[11], s12 = lms[12], h23 = lms[23], h24 = lms[24]
+      const nose = lms[0], s11 = lms[11], s12 = lms[12], h23 = lms[23], h24 = lms[24]
+
+      // Torso quad: shoulders + hips
       if (s11 && s12 && h23 && h24 &&
           (s11.visibility ?? 1) >= 0.3 && (s12.visibility ?? 1) >= 0.3 &&
           (h23.visibility ?? 1) >= 0.3 && (h24.visibility ?? 1) >= 0.3) {
@@ -339,6 +400,16 @@ async function main() {
           { x: (1 - s12.x) * canvas.width, y: s12.y * canvas.height },
           { x: (1 - h24.x) * canvas.width, y: h24.y * canvas.height },
           { x: (1 - h23.x) * canvas.width, y: h23.y * canvas.height },
+        ])
+      }
+
+      // Neck/head triangle: nose + shoulders
+      if (nose && s11 && s12 &&
+          (nose.visibility ?? 1) >= 0.3 && (s11.visibility ?? 1) >= 0.3 && (s12.visibility ?? 1) >= 0.3) {
+        physics.pushFromTorso([
+          { x: (1 - nose.x) * canvas.width, y: nose.y * canvas.height },
+          { x: (1 - s11.x) * canvas.width,  y: s11.y * canvas.height },
+          { x: (1 - s12.x) * canvas.width,  y: s12.y * canvas.height },
         ])
       }
     }
