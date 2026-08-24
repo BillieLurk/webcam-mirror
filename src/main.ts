@@ -2,7 +2,7 @@ import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
 import { DepthReceiver } from './depth-receiver'
-import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG } from './assets'
+import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
 import type { DepthFrame } from './depth-receiver'
 import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
@@ -415,7 +415,7 @@ async function main() {
     }
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5, PRODUCT_INFO)
 
     requestAnimationFrame(loop)
   }

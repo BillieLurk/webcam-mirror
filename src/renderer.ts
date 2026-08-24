@@ -1,7 +1,7 @@
 import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 import type { FloatingObject } from './physics'
 import type { DepthFrame } from './depth-receiver'
-import type { ImageInfo } from './assets'
+import type { ImageInfo, ProductInfo } from './assets'
 import { detectFist, getPalmCenter } from './tracker'
 
 // Offscreen canvases for background replacement compositing, lazily created
@@ -226,6 +226,7 @@ export function renderFrame(
   bgEnabled: boolean,
   depthFrame: DepthFrame | null,
   _depthThreshold: number,
+  productInfo: Record<string, ProductInfo>,
 ) {
   const { width: W, height: H } = ctx.canvas
 
@@ -253,6 +254,10 @@ export function renderFrame(
   // Physics objects
   for (const obj of objects) {
     drawObject(ctx, obj, images, hoverObjects.has(obj), debugMode)
+    if (obj.cardProgress > 0) {
+      const info = productInfo[obj.imageKey]
+      if (info) drawDescriptionCard(ctx, obj, info)
+    }
   }
 
   // Debug: pose skeleton
@@ -343,6 +348,88 @@ function drawObject(
     ctx.fillText(label, bx, by)
     ctx.restore()
   }
+}
+
+function wrapText(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxW: number, lineH: number, maxLines: number) {
+  const words = text.split(' ')
+  let line = ''
+  let lineCount = 0
+  for (let n = 0; n < words.length; n++) {
+    const test = line + words[n] + ' '
+    if (ctx.measureText(test).width > maxW && n > 0) {
+      ctx.fillText(line.trim(), x, y + lineCount * lineH)
+      lineCount++
+      if (lineCount >= maxLines) return
+      line = words[n] + ' '
+    } else {
+      line = test
+    }
+  }
+  if (lineCount < maxLines) ctx.fillText(line.trim(), x, y + lineCount * lineH)
+}
+
+function drawDescriptionCard(ctx: CanvasRenderingContext2D, obj: FloatingObject, info: ProductInfo) {
+  const p = obj.cardProgress
+  const ease = p * p * (3 - 2 * p)  // smoothstep
+
+  const CARD_W = 270
+  const CARD_H = info.howToUse ? 112 : 70
+  const PAD_X = 14
+  const GAP = obj.drawW / 2 + 18
+  const T = -CARD_H / 2  // top edge in card space
+
+  ctx.save()
+  ctx.globalAlpha = obj.alpha * ease
+  ctx.translate(obj.body.position.x + GAP, obj.body.position.y)
+  ctx.rotate(-Math.PI / 2)
+  ctx.translate((1 - ease) * 28, 0)
+
+  // Card background
+  ctx.fillStyle = 'rgba(8,8,8,0.72)'
+  ctx.beginPath()
+  ctx.roundRect(0, T, CARD_W, CARD_H, 9)
+  ctx.fill()
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+
+  const maxTextW = CARD_W - PAD_X * 2
+
+  // Product name — truncate with ellipsis if too wide
+  ctx.fillStyle = 'rgba(255,255,255,0.95)'
+  ctx.font = 'bold 13px system-ui,-apple-system,sans-serif'
+  let name = info.name
+  if (ctx.measureText(name).width > maxTextW) {
+    while (name.length > 0 && ctx.measureText(name + '…').width > maxTextW) name = name.slice(0, -1)
+    name += '…'
+  }
+  ctx.fillText(name, PAD_X, T + 20)
+
+  // Description — 2 lines
+  ctx.fillStyle = 'rgba(255,255,255,0.5)'
+  ctx.font = '11px system-ui,-apple-system,sans-serif'
+  wrapText(ctx, info.description, PAD_X, T + 36, maxTextW, 15, 2)
+
+  // How to use section
+  if (info.howToUse) {
+    const divY = T + 70
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(PAD_X, divY)
+    ctx.lineTo(CARD_W - PAD_X, divY)
+    ctx.stroke()
+
+    ctx.fillStyle = 'rgba(6,255,165,0.65)'
+    ctx.font = 'bold 9px system-ui,-apple-system,sans-serif'
+    ctx.fillText('HOW TO USE', PAD_X, divY + 13)
+
+    ctx.fillStyle = 'rgba(255,255,255,0.45)'
+    ctx.font = '11px system-ui,-apple-system,sans-serif'
+    wrapText(ctx, info.howToUse, PAD_X, divY + 27, maxTextW, 15, 2)
+  }
+
+  ctx.restore()
 }
 
 function drawPoseSkeleton(

@@ -22,6 +22,8 @@ export interface FloatingObject {
   scale: number
   /** Visual alpha 0–1, matches scale. */
   alpha: number
+  /** Description card animation progress 0–1. Drives enter/exit of the info card. */
+  cardProgress: number
 }
 
 interface GrabState {
@@ -112,7 +114,7 @@ export class PhysicsScene {
 
     const lifespan = 12000 + Math.random() * 13000  // 12–25 s
     const radius = Math.hypot(bodyW, bodyH) / 2
-    const obj: FloatingObject = { body, imageKey, drawW, drawH, drawX, drawY, radius, grabbed: false, lifespan, age: 0, scale: 0, alpha: 0 }
+    const obj: FloatingObject = { body, imageKey, drawW, drawH, drawX, drawY, radius, grabbed: false, lifespan, age: 0, scale: 0, alpha: 0, cardProgress: 0 }
     this.floatingObjects.push(obj)
     Composite.add(this.engine.world, body)
     return obj
@@ -308,6 +310,13 @@ export class PhysicsScene {
     for (const obj of this.floatingObjects) {
       // Age only while not grabbed
       if (!obj.grabbed) obj.age = Math.min(obj.age + dt, obj.lifespan)
+
+      // Description card animation
+      if (obj.grabbed) {
+        obj.cardProgress = Math.min(1, obj.cardProgress + dt / 280)
+      } else {
+        obj.cardProgress = Math.max(0, obj.cardProgress - dt / 180)
+      }
 
       // Compute scale/alpha: smoothstep in, full, smoothstep out
       const lifeLeft = obj.lifespan - obj.age
