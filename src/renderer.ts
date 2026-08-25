@@ -94,6 +94,7 @@ function drawWithDepth(
   bgColor: string,
   W: number,
   H: number,
+  threshold: number,
 ) {
   ensureOffscreen(W, H)
   const oc = offVideoCtx!
@@ -108,7 +109,7 @@ function drawWithDepth(
 
   const { depthData, depthWidth: dw, depthHeight: dh } = frame
 
-  const THRESHOLD = 2.5  // metres — person closer than this is kept
+  const THRESHOLD = threshold  // metres — person closer than this is kept
   const EDGE      = 0.3  // soft transition zone width (metres either side of threshold)
   const TEMPORAL  = 0.55 // how much of the previous frame's alpha to blend in (0=none, higher=smoother)
 
@@ -225,7 +226,7 @@ export function renderFrame(
   bgColor: string,
   bgEnabled: boolean,
   depthFrame: DepthFrame | null,
-  _depthThreshold: number,
+  depthThreshold: number,
   productInfo: Record<string, ProductInfo>,
 ) {
   const { width: W, height: H } = ctx.canvas
@@ -234,7 +235,7 @@ export function renderFrame(
 
   if (depthFrame) {
     // Depth camera path: use iPhone color + depth for background removal
-    drawWithDepth(ctx, depthFrame, bgColor, W, H)
+    drawWithDepth(ctx, depthFrame, bgColor, W, H, depthThreshold)
   } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
     // ML segmentation path: webcam + MediaPipe confidence mask
     drawWithBackground(ctx, video, segmentation, bgColor, W, H)

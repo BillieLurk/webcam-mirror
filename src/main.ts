@@ -47,6 +47,7 @@ async function main() {
   let lastHands: HandLandmarkerResult | null = null
   let lastSeg: ImageSegmenterResult | null = null
   let lastDepthFrame: DepthFrame | null = null
+  let depthThreshold = 2.5
   let prevTimestamp = 0
 
   // Depth camera receiver
@@ -202,6 +203,13 @@ async function main() {
     row.append(lbl, slider, val)
     return row
   }
+
+  // Depth threshold slider
+  const depthSection = document.createElement('div')
+  depthSection.className = 'tuning-section-label'
+  depthSection.textContent = 'Depth Camera'
+  tuningPanel.append(depthSection)
+  tuningPanel.append(makeSliderRow('BG cut (m)', depthThreshold, 0.5, 6.0, 0.1, v => { depthThreshold = v }))
 
   // Max objects slider
   const maxObjSection = document.createElement('div')
@@ -415,7 +423,7 @@ async function main() {
     }
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, 2.5, PRODUCT_INFO)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, depthThreshold, PRODUCT_INFO)
 
     requestAnimationFrame(loop)
   }
