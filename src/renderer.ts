@@ -50,19 +50,24 @@ export function captureBgFrame(video: HTMLVideoElement, W: number, H: number) {
 export function hasBgModel(): boolean { return bgModel !== null }
 
 /**
- * Adaptive background subtraction.
+ * Combined background subtraction + MediaPipe segmentation.
  *
- * Compares each pixel against a learned background model.
- * Pixels that match the model are replaced with bgColor.
- * Pixels that differ (the person) are kept.
+ * BG subtraction gives pixel-sharp edges; MediaPipe provides semantic
+ * understanding of where the person is. A pixel is only replaced with
+ * the background colour when BOTH methods agree it is background:
  *
- * Background pixels slowly update the model at `adaptRate` per frame,
- * so if the camera is nudged the background gradually re-learns itself.
- * Foreground pixels never update the model, so the person never burns in.
+ *   finalBgAlpha = bgSubAlpha × (1 − mediapipePersonConf)
+ *
+ * This prevents lighting changes or camera noise from creating holes in
+ * the person while still producing cleaner edges than MediaPipe alone.
+ *
+ * The background model adapts slowly so a nudged camera re-learns over
+ * time, but only updates pixels confirmed as background by both methods.
  */
 function drawWithBgSub(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
+  segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
   W: number,
   H: number,
@@ -73,6 +78,16 @@ function drawWithBgSub(
   const pixels = imageData.data
   const [bgR, bgG, bgB] = parseCssColor(bgColor)
   const numPx = W * H
+
+  // MediaPipe mask — bilinear sampled per pixel
+  let maskArr: Float32Array | null = null
+  let maskW = 0, maskH = 0
+  if (segmentation?.confidenceMasks?.length) {
+    const m = segmentation.confidenceMasks[0]
+    maskArr = m.getAsFloat32Array()
+    maskW = m.width
+    maskH = m.height
+  }
 
   // Auto-initialise model from the first frame if not yet captured
   if (!bgModel || bgModel.length !== numPx * 3) {
@@ -88,42 +103,63 @@ function drawWithBgSub(
     prevBgAlpha = new Float32Array(numPx)
   }
 
-  const EDGE     = threshold * 0.35  // soft transition zone around the threshold
-  const TEMPORAL = 0.45              // how much of the previous frame's alpha to retain
+  const EDGE     = threshold * 0.4
+  const TEMPORAL = 0.5
 
-  for (let i = 0, j = 0, pi = 0; i < pixels.length; i += 4, j += 3, pi++) {
-    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
-    const mr = bgModel[j], mg = bgModel[j + 1], mb = bgModel[j + 2]
+  for (let cy = 0; cy < H; cy++) {
+    const fy = maskArr ? (cy / H) * maskH : 0
+    for (let cx = 0; cx < W; cx++) {
+      const pi = cy * W + cx
+      const i  = pi * 4
+      const j  = pi * 3
 
-    const dr = r - mr, dg = g - mg, db = b - mb
-    const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
+      const mr = bgModel[j], mg = bgModel[j + 1], mb = bgModel[j + 2]
 
-    // bgAlpha: 1 = background (replace with color), 0 = foreground (keep person)
-    let raw: number
-    if (dist < threshold - EDGE) {
-      raw = 1  // clearly background
-    } else if (dist > threshold + EDGE) {
-      raw = 0  // clearly foreground
-    } else {
-      const t = (dist - (threshold - EDGE)) / (2 * EDGE)
-      raw = 1 - t * t * (3 - 2 * t)  // smoothstep, 1→0 as dist crosses threshold
-    }
+      // BG subtraction: how background-like is this pixel?
+      const dr = r - mr, dg = g - mg, db = b - mb
+      const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+      let bgSubAlpha: number
+      if (dist < threshold - EDGE)      bgSubAlpha = 1
+      else if (dist > threshold + EDGE) bgSubAlpha = 0
+      else {
+        const t = (dist - (threshold - EDGE)) / (2 * EDGE)
+        bgSubAlpha = 1 - t * t * (3 - 2 * t)
+      }
 
-    // Temporal smoothing: blend with previous alpha to suppress per-frame flicker
-    const alpha = prevBgAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
-    prevBgAlpha[pi] = alpha
+      // MediaPipe: sample person confidence, convert to background confidence
+      let mlBgAlpha = 1
+      if (maskArr) {
+        const vx = W - 1 - cx  // un-mirror x for mask coords
+        const fx = (vx / W) * maskW
+        const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, maskW - 1)
+        const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, maskH - 1)
+        const tx = fx - x0, ty = fy - y0
+        const personConf =
+          (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
+          ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
+        mlBgAlpha = 1 - personConf
+      }
 
-    // Adapt background model only for background-classified pixels
-    if (raw > 0.5) {
-      bgModel[j]     += (r - bgModel[j])     * adaptRate
-      bgModel[j + 1] += (g - bgModel[j + 1]) * adaptRate
-      bgModel[j + 2] += (b - bgModel[j + 2]) * adaptRate
-    }
+      // Combined: require BOTH to agree it is background
+      const raw = bgSubAlpha * mlBgAlpha
 
-    if (alpha > 0.005) {
-      pixels[i]     = ((r * (1 - alpha)) + bgR * alpha) | 0
-      pixels[i + 1] = ((g * (1 - alpha)) + bgG * alpha) | 0
-      pixels[i + 2] = ((b * (1 - alpha)) + bgB * alpha) | 0
+      // Temporal smoothing to suppress frame-to-frame flicker
+      const alpha = prevBgAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
+      prevBgAlpha[pi] = alpha
+
+      // Update model only for confidently-background pixels (both methods agree)
+      if (raw > 0.75) {
+        bgModel[j]     += (r - bgModel[j])     * adaptRate
+        bgModel[j + 1] += (g - bgModel[j + 1]) * adaptRate
+        bgModel[j + 2] += (b - bgModel[j + 2]) * adaptRate
+      }
+
+      if (alpha > 0.005) {
+        pixels[i]     = ((r * (1 - alpha)) + bgR * alpha) | 0
+        pixels[i + 1] = ((g * (1 - alpha)) + bgG * alpha) | 0
+        pixels[i + 2] = ((b * (1 - alpha)) + bgB * alpha) | 0
+      }
     }
   }
 
@@ -254,8 +290,8 @@ export function renderFrame(
   ctx.clearRect(0, 0, W, H)
 
   if (bgEnabled && bgModel) {
-    // Bg subtraction path: model has been captured, use it
-    drawWithBgSub(ctx, video, bgColor, W, H, bgSubThreshold, bgSubAdaptRate)
+    // Combined path: bg subtraction × MediaPipe (best quality)
+    drawWithBgSub(ctx, video, segmentation, bgColor, W, H, bgSubThreshold, bgSubAdaptRate)
   } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
     // ML segmentation fallback: no bg model captured yet
     drawWithSegmentation(ctx, video, segmentation, bgColor, W, H)

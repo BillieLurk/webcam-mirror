@@ -43,8 +43,8 @@ async function main() {
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
   let lastSeg: ImageSegmenterResult | null = null
-  let bgSubThreshold = 25
-  let bgSubAdaptRate = 0.003
+  let bgSubThreshold = 35
+  let bgSubAdaptRate = 0.002
   let prevTimestamp = 0
 
   // Camera
