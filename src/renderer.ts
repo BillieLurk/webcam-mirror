@@ -103,8 +103,10 @@ function drawWithBgSub(
     prevBgAlpha = new Float32Array(numPx)
   }
 
-  const EDGE     = threshold * 0.4
-  const TEMPORAL = 0.5
+  // MediaPipe: person confidence above this → veto removal regardless of BG sub
+  const PERSON_VETO = 0.75
+  const EDGE        = threshold * 0.4
+  const TEMPORAL    = 0.5
 
   for (let cy = 0; cy < H; cy++) {
     const fy = maskArr ? (cy / H) * maskH : 0
@@ -116,7 +118,7 @@ function drawWithBgSub(
       const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
       const mr = bgModel[j], mg = bgModel[j + 1], mb = bgModel[j + 2]
 
-      // BG subtraction: how background-like is this pixel?
+      // BG subtraction at full video resolution → sharp pixel-level decision
       const dr = r - mr, dg = g - mg, db = b - mb
       const dist = Math.sqrt(dr * dr + dg * dg + db * db)
       let bgSubAlpha: number
@@ -127,8 +129,9 @@ function drawWithBgSub(
         bgSubAlpha = 1 - t * t * (3 - 2 * t)
       }
 
-      // MediaPipe: sample person confidence, convert to background confidence
-      let mlBgAlpha = 1
+      // MediaPipe veto: if it's very confident this is a person, never remove it.
+      // Otherwise BG sub makes the full-resolution call.
+      let raw = bgSubAlpha
       if (maskArr) {
         const vx = W - 1 - cx  // un-mirror x for mask coords
         const fx = (vx / W) * maskW
@@ -138,17 +141,14 @@ function drawWithBgSub(
         const personConf =
           (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
           ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
-        mlBgAlpha = 1 - personConf
+        if (personConf > PERSON_VETO) raw = 0  // hard veto: always keep the person
       }
-
-      // Combined: require BOTH to agree it is background
-      const raw = bgSubAlpha * mlBgAlpha
 
       // Temporal smoothing to suppress frame-to-frame flicker
       const alpha = prevBgAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
       prevBgAlpha[pi] = alpha
 
-      // Update model only for confidently-background pixels (both methods agree)
+      // Update model only where BG sub and MediaPipe both agree it's background
       if (raw > 0.75) {
         bgModel[j]     += (r - bgModel[j])     * adaptRate
         bgModel[j + 1] += (g - bgModel[j + 1]) * adaptRate
@@ -198,12 +198,18 @@ function drawWithSegmentation(
       const personConf =
         (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
         ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
-      const bgAlpha = 1 - personConf
-      if (bgAlpha > 0) {
+
+      // Steepen the confidence curve — map [0.3, 0.7] → [0, 1] smoothstep
+      // so uncertain pixels snap to one side rather than feathering across many pixels
+      const t = Math.max(0, Math.min(1, (personConf - 0.3) / 0.4))
+      const sharpConf = t * t * (3 - 2 * t)
+      const bgAlpha = 1 - sharpConf
+
+      if (bgAlpha > 0.005) {
         const pi = (cy * W + cx) * 4
-        pixels[pi]     = (pixels[pi]     * personConf + bgR * bgAlpha) | 0
-        pixels[pi + 1] = (pixels[pi + 1] * personConf + bgG * bgAlpha) | 0
-        pixels[pi + 2] = (pixels[pi + 2] * personConf + bgB * bgAlpha) | 0
+        pixels[pi]     = (pixels[pi]     * sharpConf + bgR * bgAlpha) | 0
+        pixels[pi + 1] = (pixels[pi + 1] * sharpConf + bgG * bgAlpha) | 0
+        pixels[pi + 2] = (pixels[pi + 2] * sharpConf + bgB * bgAlpha) | 0
       }
     }
   }
