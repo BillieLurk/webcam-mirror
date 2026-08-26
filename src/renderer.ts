@@ -1,4 +1,4 @@
-import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
+import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
 import type { FloatingObject } from './physics'
 import type { DepthFrame } from './depth-receiver'
 import type { ImageInfo, ProductInfo } from './assets'
@@ -10,6 +10,47 @@ let offVideoCtx: OffscreenCanvasRenderingContext2D | null = null
 
 // Temporal smoothing buffer for depth background alpha — reduces flicker between frames
 let prevDepthAlpha: Float32Array | null = null
+
+// Per-frame scratch buffers for spatial alpha smoothing — see blurAlpha below.
+let frameAlphaScratch: Float32Array | null = null
+let blurredAlphaScratch: Float32Array | null = null
+
+/**
+ * 3x3 box blur over the raw per-pixel foreground/background alpha, applied
+ * once per frame after temporal smoothing. prevDepthAlpha (temporal history)
+ * stays unblurred so it accurately reflects each pixel's own past — only the
+ * alpha actually used to composite this frame's colors gets the extra spatial
+ * pass, which is what directly softens the jagged/speckled cutout edge.
+ */
+function blurAlpha(data: Float32Array, w: number, h: number, out: Float32Array) {
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - 1), y1 = Math.min(h - 1, y + 1)
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - 1), x1 = Math.min(w - 1, x + 1)
+      let sum = 0, count = 0
+      for (let yy = y0; yy <= y1; yy++) {
+        const rowBase = yy * w
+        for (let xx = x0; xx <= x1; xx++) {
+          sum += data[rowBase + xx]
+          count++
+        }
+      }
+      out[y * w + x] = sum / count
+    }
+  }
+}
+
+// Cache of the last composited depth+color result — the depth camera only produces
+// a new frame ~20-25fps while rAF runs ~60fps, so redoing the full per-pixel
+// bilinear/temporal blend below on an unchanged frame is wasted CPU work that
+// compounds badly over time. main.ts always constructs a fresh DepthFrame object
+// per incoming message, so reference equality is a free "is this actually new" check.
+let cachedDepthFrame: DepthFrame | null = null
+let cachedDepthThreshold = NaN
+let cachedDepthBgColor = ''
+let cachedDepthW = -1
+let cachedDepthH = -1
+let cachedDepthComposite: ImageData | null = null
 
 function ensureOffscreen(w: number, h: number) {
   if (!offVideo || offVideo.width !== w || offVideo.height !== h) {
@@ -27,56 +68,86 @@ function sampleBilinear(arr: Float32Array, mw: number, mh: number, fx: number, f
   return (1 - ty) * ((1 - tx) * v00 + tx * v10) + ty * ((1 - tx) * v01 + tx * v11)
 }
 
-function drawWithBackground(
-  ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  segmentation: { confidenceMasks?: Array<{ getAsFloat32Array(): Float32Array; width: number; height: number }> },
-  bgColor: string,
-  W: number,
-  H: number,
-) {
-  ensureOffscreen(W, H)
-  const oc = offVideoCtx!
+let smoothedDepthScratch: Float32Array | null = null
 
-  // Draw mirrored video into offscreen canvas
-  oc.save()
-  oc.translate(W, 0)
-  oc.scale(-1, 1)
-  oc.drawImage(video, 0, 0, W, H)
-  oc.restore()
+/**
+ * 3x3 box blur over raw depth, averaging only valid (nonzero) neighbors so a
+ * genuinely empty region (all neighbors invalid) stays invalid rather than
+ * fabricating a depth value. ToF depth is speckly — individual pixels flip
+ * in/out of validity or jump by tens of centimetres frame to frame — and that
+ * speckle otherwise shows up directly as noisy holes in the background cutout.
+ */
+function smoothDepth(data: Float32Array, dw: number, dh: number): Float32Array {
+  if (!smoothedDepthScratch || smoothedDepthScratch.length !== data.length) {
+    smoothedDepthScratch = new Float32Array(data.length)
+  }
+  const out = smoothedDepthScratch
+  for (let y = 0; y < dh; y++) {
+    const y0 = Math.max(0, y - 1), y1 = Math.min(dh - 1, y + 1)
+    for (let x = 0; x < dw; x++) {
+      const x0 = Math.max(0, x - 1), x1 = Math.min(dw - 1, x + 1)
+      let sum = 0, count = 0
+      for (let yy = y0; yy <= y1; yy++) {
+        const rowBase = yy * dw
+        for (let xx = x0; xx <= x1; xx++) {
+          const v = data[rowBase + xx]
+          if (v > 0) { sum += v; count++ }
+        }
+      }
+      out[y * dw + x] = count > 0 ? sum / count : 0
+    }
+  }
+  return out
+}
 
-  const videoData = oc.getImageData(0, 0, W, H)
-  const pixels = videoData.data
+// The depth sensor's field of view is narrower than the color sensor's, so
+// once depth is reprojected onto the color image, only a central region
+// actually has coverage — everywhere outside reads as permanently invalid,
+// not an occasional dropout. Detected once from real data (this is a fixed
+// property of the hardware/alignment, not something that changes frame to
+// frame) and reused for the rest of the session, or until depthWidth/Height
+// changes (e.g. a reconnect).
+let depthCoverageRect: { x0: number; y0: number; x1: number; y1: number } | null = null
+let depthCoverageDW = -1
+let depthCoverageDH = -1
 
-  // confidenceMasks[0] = person confidence (class 0), 1.0 = definitely person
-  const maskImg = segmentation.confidenceMasks![0]
-  const maskArr = maskImg.getAsFloat32Array()
-  const maskW = maskImg.width
-  const maskH = maskImg.height
-
-  const bg = parseCssColor(bgColor)
-
-  for (let cy = 0; cy < H; cy++) {
-    // Un-mirror x: canvas left = video right
-    const fy = (cy / H) * maskH
-    for (let cx = 0; cx < W; cx++) {
-      const videoX = W - 1 - cx
-      const fx = (videoX / W) * maskW
-
-      // Bilinear sample gives a smooth gradient at person edges
-      const personConf = sampleBilinear(maskArr, maskW, maskH, fx, fy)
-      const bgAlpha = 1 - personConf
-
-      if (bgAlpha > 0) {
-        const pi = (cy * W + cx) * 4
-        pixels[pi]     = (pixels[pi]     * personConf + bg[0] * bgAlpha) | 0
-        pixels[pi + 1] = (pixels[pi + 1] * personConf + bg[1] * bgAlpha) | 0
-        pixels[pi + 2] = (pixels[pi + 2] * personConf + bg[2] * bgAlpha) | 0
+function detectCoverageRect(data: Float32Array, dw: number, dh: number) {
+  const rowValid = new Float32Array(dh)
+  const colValid = new Float32Array(dw)
+  for (let y = 0; y < dh; y++) {
+    const base = y * dw
+    for (let x = 0; x < dw; x++) {
+      if (data[base + x] > 0) {
+        rowValid[y]++
+        colValid[x]++
       }
     }
   }
+  // A row/column counts as "covered" once a meaningful fraction of it has
+  // real depth — avoids letting a few stray valid pixels outside the true
+  // coverage region (sensor noise) drag the crop back out to the full frame.
+  const ROW_FRAC = 0.3
+  const COL_FRAC = 0.3
+  let y0 = 0, y1 = dh - 1
+  while (y0 < dh && rowValid[y0] < dw * ROW_FRAC) y0++
+  while (y1 > y0 && rowValid[y1] < dw * ROW_FRAC) y1--
+  let x0 = 0, x1 = dw - 1
+  while (x0 < dw && colValid[x0] < dh * COL_FRAC) x0++
+  while (x1 > x0 && colValid[x1] < dh * COL_FRAC) x1--
+  return { x0, y0, x1: x1 + 1, y1: y1 + 1 } // x1/y1 exclusive
+}
 
-  ctx.putImageData(videoData, 0, 0)
+/**
+ * The same coverage crop drawWithDepth uses for the displayed video, exposed
+ * so main.ts can crop MediaPipe's tracking input identically — otherwise pose/
+ * hand landmarks are computed against the full uncropped frame while the
+ * video they're overlaid on is a zoomed-in crop, throwing off the skeleton
+ * position by however much the crop offsets/rescales things. Returns null
+ * before the first depth frame has been composited (rect not detected yet);
+ * callers should fall back to the uncropped frame for that one frame.
+ */
+export function getDepthCoverageRect(): { x0: number; y0: number; x1: number; y1: number } | null {
+  return depthCoverageRect
 }
 
 /**
@@ -96,63 +167,136 @@ function drawWithDepth(
   H: number,
   threshold: number,
 ) {
-  ensureOffscreen(W, H)
+  // Composite at reduced resolution and let the GPU upscale the draw — the
+  // per-pixel loop below (bilinear depth sample + temporal blend per pixel)
+  // is the single most expensive thing in this file, and it scales with pixel
+  // count. Set below 1 to trade edge sharpness for speed if frame rate can't
+  // keep up; 1 = full resolution.
+  const SCALE = 1
+  const cw = Math.max(1, Math.round(W * SCALE))
+  const ch = Math.max(1, Math.round(H * SCALE))
+
+  if (
+    frame === cachedDepthFrame &&
+    threshold === cachedDepthThreshold &&
+    bgColor === cachedDepthBgColor &&
+    W === cachedDepthW &&
+    H === cachedDepthH &&
+    cachedDepthComposite
+  ) {
+    // Nothing new since the last composite — reuse it instead of redoing the
+    // full per-pixel loop below (a cheap bulk copy + GPU scale vs. ~cw*ch
+    // bilinear samples).
+    ensureOffscreen(cw, ch)
+    offVideoCtx!.putImageData(cachedDepthComposite, 0, 0)
+    ctx.drawImage(offVideo!, 0, 0, cw, ch, 0, 0, W, H)
+    return
+  }
+
+  const { depthWidth: dw, depthHeight: dh } = frame
+  const depthData = smoothDepth(frame.depthData, dw, dh)
+
+  if (!depthCoverageRect || dw !== depthCoverageDW || dh !== depthCoverageDH) {
+    depthCoverageRect = detectCoverageRect(depthData, dw, dh)
+    depthCoverageDW = dw
+    depthCoverageDH = dh
+  }
+  const cov = depthCoverageRect
+  const covW = cov.x1 - cov.x0
+  const covH = cov.y1 - cov.y0
+
+  ensureOffscreen(cw, ch)
   const oc = offVideoCtx!
 
-  // Draw the iPhone color frame scaled to canvas (it arrives as landscape bitmap)
-  oc.clearRect(0, 0, W, H)
-  oc.drawImage(frame.colorBitmap, 0, 0, W, H)
+  // Draw the color frame downscaled (cheap GPU blit), mirrored to match every
+  // other coordinate in this app (skeleton, hand overlays, physics landmark
+  // positions all assume a mirrored image via the (1 - x) flip in lm2c below
+  // and in main.ts) — this was never mirrored on the depth-camera path, so the
+  // skeleton and video disagreed about which side is which. Cropped to the
+  // depth sensor's actual coverage region (see detectCoverageRect above) —
+  // colorBitmap and depthData share the same pixel grid post-alignment, so
+  // the crop rect applies directly without any coordinate conversion.
+  oc.clearRect(0, 0, cw, ch)
+  oc.save()
+  oc.translate(cw, 0)
+  oc.scale(-1, 1)
+  oc.drawImage(frame.colorBitmap, cov.x0, cov.y0, covW, covH, 0, 0, cw, ch)
+  oc.restore()
 
-  const imageData = oc.getImageData(0, 0, W, H)
+  const imageData = oc.getImageData(0, 0, cw, ch)
   const pixels = imageData.data
   const bg = parseCssColor(bgColor)
-
-  const { depthData, depthWidth: dw, depthHeight: dh } = frame
 
   const THRESHOLD = threshold  // metres — person closer than this is kept
   const EDGE      = 0.3  // soft transition zone width (metres either side of threshold)
   const TEMPORAL  = 0.55 // how much of the previous frame's alpha to blend in (0=none, higher=smoother)
 
-  const numPixels = W * H
+  const numPixels = cw * ch
   if (!prevDepthAlpha || prevDepthAlpha.length !== numPixels) {
     prevDepthAlpha = new Float32Array(numPixels)
   }
+  if (!frameAlphaScratch || frameAlphaScratch.length !== numPixels) {
+    frameAlphaScratch = new Float32Array(numPixels)
+    blurredAlphaScratch = new Float32Array(numPixels)
+  }
 
-  for (let cy = 0; cy < H; cy++) {
-    const fy = (cy / H) * dh
-    for (let cx = 0; cx < W; cx++) {
-      const fx = (cx / W) * dw
+  for (let cy = 0; cy < ch; cy++) {
+    const fy = cov.y0 + (cy / ch) * covH
+    for (let cx = 0; cx < cw; cx++) {
+      // depthData is in the camera's original (unmirrored) orientation, but the
+      // color pixels we're blending against were just drawn mirrored above — flip
+      // the sample coordinate so the depth mask lines up with the flipped video.
+      // Mapped through the same coverage crop as the color draw above.
+      const fx = cov.x0 + ((cw - 1 - cx) / cw) * covW
       const depth = sampleBilinear(depthData, dw, dh, fx, fy)
+      const pi = cy * cw + cx
 
-      // Raw background alpha: 0 = fully person, 1 = fully background
+      // Only reveal what's confidently close — everything else is background,
+      // including invalid/no-data readings (depth === 0, whether that's from
+      // something too close to measure or too far/low-signal to measure).
+      // Simpler and more predictable than trying to guess which invalid
+      // readings mean "close" vs "far".
       let raw: number
-      if (depth === 0) {
-        raw = 1  // no sensor data → background
-      } else if (depth < THRESHOLD - EDGE) {
+      if (depth > 0 && depth < THRESHOLD - EDGE) {
         raw = 0  // clearly in front
-      } else if (depth > THRESHOLD + EDGE) {
-        raw = 1  // clearly behind
-      } else {
+      } else if (depth > 0 && depth <= THRESHOLD + EDGE) {
         // Smooth S-curve across the edge zone
         const t = (depth - (THRESHOLD - EDGE)) / (2 * EDGE)
         raw = t * t * (3 - 2 * t)  // smoothstep
+      } else {
+        raw = 1  // background: far, or no valid reading at all
       }
 
       // Temporal blend: mix with previous frame to suppress flicker
-      const pi = cy * W + cx
       const alpha = prevDepthAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
       prevDepthAlpha[pi] = alpha
-
-      if (alpha > 0.01) {
-        const idx = pi * 4
-        pixels[idx]     = ((pixels[idx]     * (1 - alpha)) + bg[0] * alpha) | 0
-        pixels[idx + 1] = ((pixels[idx + 1] * (1 - alpha)) + bg[1] * alpha) | 0
-        pixels[idx + 2] = ((pixels[idx + 2] * (1 - alpha)) + bg[2] * alpha) | 0
-      }
+      frameAlphaScratch[pi] = alpha
     }
   }
 
-  ctx.putImageData(imageData, 0, 0)
+  // Spatial smoothing pass — softens the jagged/speckled cutout edge that
+  // per-pixel depth noise leaves behind, on top of the temporal smoothing above.
+  blurAlpha(frameAlphaScratch, cw, ch, blurredAlphaScratch!)
+
+  for (let pi = 0; pi < numPixels; pi++) {
+    const alpha = blurredAlphaScratch![pi]
+    if (alpha > 0.01) {
+      const idx = pi * 4
+      pixels[idx]     = ((pixels[idx]     * (1 - alpha)) + bg[0] * alpha) | 0
+      pixels[idx + 1] = ((pixels[idx + 1] * (1 - alpha)) + bg[1] * alpha) | 0
+      pixels[idx + 2] = ((pixels[idx + 2] * (1 - alpha)) + bg[2] * alpha) | 0
+    }
+  }
+
+  oc.putImageData(imageData, 0, 0)
+  ctx.drawImage(offVideo!, 0, 0, cw, ch, 0, 0, W, H)
+
+  cachedDepthFrame = frame
+  cachedDepthThreshold = threshold
+  cachedDepthBgColor = bgColor
+  cachedDepthW = W
+  cachedDepthH = H
+  cachedDepthComposite = imageData
 }
 
 /** Parse a CSS hex color like "#rrggbb" into [r, g, b]. */
@@ -222,9 +366,7 @@ export function renderFrame(
   grabbing: Map<number, boolean>,
   hoverObjects: Set<FloatingObject>,
   images: Map<string, ImageInfo>,
-  segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
-  bgEnabled: boolean,
   depthFrame: DepthFrame | null,
   depthThreshold: number,
   productInfo: Record<string, ProductInfo>,
@@ -236,16 +378,17 @@ export function renderFrame(
   if (depthFrame) {
     // Depth camera path: use iPhone color + depth for background removal
     drawWithDepth(ctx, depthFrame, bgColor, W, H, depthThreshold)
-  } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
-    // ML segmentation path: webcam + MediaPipe confidence mask
-    drawWithBackground(ctx, video, segmentation, bgColor, W, H)
-  } else {
+  } else if (video.readyState >= 2) {
     // Plain mirrored webcam
     ctx.save()
     ctx.translate(W, 0)
     ctx.scale(-1, 1)
     ctx.drawImage(video, 0, 0, W, H)
     ctx.restore()
+  } else {
+    // No local webcam and no depth camera connected yet
+    ctx.fillStyle = '#000'
+    ctx.fillRect(0, 0, W, H)
   }
 
   // Subtle dark vignette to improve contrast of overlays

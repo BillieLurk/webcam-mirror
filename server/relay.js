@@ -25,6 +25,11 @@ import os from 'os'
 
 const PORT = parseInt(process.env.PORT ?? '8080', 10)
 
+// A single depth frame is ~1.8MB (1280x720 uint16mm) — a couple of frames'
+// worth of backlog is a reasonable "still keeping up" threshold before we
+// start dropping to that viewer.
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+
 const httpServer = createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.end('Depth relay running\n')
@@ -52,9 +57,16 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (data, isBinary) => {
       if (!isBinary || viewers.size === 0) return
       for (const viewer of viewers) {
-        if (viewer.readyState === WebSocket.OPEN) {
-          viewer.send(data, { binary: true })
-        }
+        if (viewer.readyState !== WebSocket.OPEN) continue
+        // ws.send() buffers internally and never blocks — with no check here, a
+        // viewer that can't drain as fast as frames arrive just accumulates an
+        // ever-growing backlog in this process's memory (seen firsthand: relay
+        // RSS climbed past 5GB), and the viewer falls further and further behind
+        // real time since it still has to receive that backlog in order. Drop
+        // frames to a viewer that's already behind instead — it'll catch back
+        // up to "now" on the next frame rather than wading through stale ones.
+        if (viewer.bufferedAmount > MAX_BUFFERED_BYTES) continue
+        viewer.send(data, { binary: true })
       }
     })
 

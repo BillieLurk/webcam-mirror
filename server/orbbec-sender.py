@@ -10,11 +10,15 @@ Install deps:
   pip install pyorbbecsdk websocket-client opencv-python
 
 Wire format (matches relay.js / depth-receiver.ts):
-  [0]      uint8    type  0=colour JPEG  1=depth Float32LE metres
+  [0]      uint8    type  0=colour JPEG  2=depth Uint16LE millimetres
   [1..4]   uint32LE width
   [5..8]   uint32LE height
   [9..12]  uint32LE timestamp ms
   [13..]   payload
+
+Depth is sent as raw uint16 millimetres (type 2), not float32 metres (type 1,
+used by the iPhone sender) — half the bytes at 1280x720 (1.8MB vs 3.6MB per
+frame), which matters a lot for a relay fanning out to multiple viewers.
 """
 
 import struct
@@ -27,15 +31,14 @@ import numpy as np
 import cv2
 from pyorbbecsdk import (
     Pipeline, Config,
-    OBSensorType, OBFormat, OBAlignMode,
+    OBSensorType, OBFormat, OBFrameAggregateOutputMode,
+    AlignFilter, OBStreamType,
 )
 import websocket  # websocket-client
 
 
 def encode_frame(frame_type: int, w: int, h: int, payload: bytes) -> bytes:
     ts = int(time.monotonic() * 1000) & 0xFFFFFFFF
-    header = struct.pack('<BIIIII', frame_type, w, h, ts)[:13]  # pack first 13 bytes
-    # Rebuild properly
     header = struct.pack('<B', frame_type) + struct.pack('<III', w, h, ts)
     return header + payload
 
@@ -52,19 +55,27 @@ def run(relay_url: str, jpeg_quality: int, target_fps: int):
     config = Config()
 
     # Enable colour stream
-    color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR)
-    color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, target_fps)
+    color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+    color_profile = color_profiles.get_video_stream_profile(1280, 720, OBFormat.RGB, target_fps)
     config.enable_stream(color_profile)
 
-    # Enable depth stream
-    depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH)
-    depth_profile = depth_profiles.get_video_stream_profile(640, 480, OBFormat.DEPTH, target_fps)
+    # Enable depth stream (native Femto Bolt depth format is Y16, raw mm)
+    depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+    depth_profile = depth_profiles.get_video_stream_profile(640, 576, OBFormat.Y16, target_fps)
     config.enable_stream(depth_profile)
 
-    # Align depth to colour
-    config.set_align_mode(OBAlignMode.HW_MODE)
+    # Don't emit a frameset until both streams are ready — avoids the constant
+    # "one stream ready, other still pending" misses that starve pairing.
+    config.set_frame_aggregate_output_mode(OBFrameAggregateOutputMode.FULL_FRAME_REQUIRE)
 
+    pipeline.enable_frame_sync()
     pipeline.start(config)
+
+    # This firmware (1.0.9) doesn't support hardware D2C for any depth/colour
+    # resolution pairing on this device, so depth→colour registration is done
+    # in software via AlignFilter instead of Config.set_align_mode(HW_MODE).
+    align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+
     print(f"Pipeline running at up to {target_fps} fps …  Press Ctrl+C to stop.")
 
     frame_interval = 1.0 / target_fps
@@ -81,8 +92,11 @@ def run(relay_url: str, jpeg_quality: int, target_fps: int):
                 continue
             last_send = now
 
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
+            aligned = align_filter.process(frames)
+            if aligned is None:
+                continue
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
             if color_frame is None or depth_frame is None:
                 continue
 
@@ -96,17 +110,20 @@ def run(relay_url: str, jpeg_quality: int, target_fps: int):
                 continue
             color_payload = jpeg_buf.tobytes()
 
-            # --- Depth → Float32 metres ---
+            # --- Depth → Uint16 millimetres ---
+            # get_depth_scale() converts raw units to millimetres (confirmed: this
+            # device reports scale=1.0 and raw values ~600 for a subject at arm's
+            # length) — sent as-is, the browser divides by 1000 for metres.
             dw = depth_frame.get_width()
             dh = depth_frame.get_height()
-            scale = depth_frame.get_depth_scale()  # typically 0.001 (mm → m)
+            scale = depth_frame.get_depth_scale()
             depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape((dh, dw))
-            depth_m = depth_raw.astype(np.float32) * scale  # 0 = no data
-            depth_payload = depth_m.tobytes()
+            depth_mm = (depth_raw.astype(np.float32) * scale).astype(np.uint16)  # 0 = no data
+            depth_payload = depth_mm.tobytes()
 
             # Send colour then depth
             ws.send_binary(encode_frame(0, cw, ch, color_payload))
-            ws.send_binary(encode_frame(1, dw, dh, depth_payload))
+            ws.send_binary(encode_frame(2, dw, dh, depth_payload))
 
     except KeyboardInterrupt:
         print("\nStopped.")

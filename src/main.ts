@@ -1,10 +1,10 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
-import { renderFrame } from './renderer'
+import { renderFrame, getDepthCoverageRect } from './renderer'
 import { DepthReceiver } from './depth-receiver'
 import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
 import type { DepthFrame } from './depth-receiver'
-import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
+import type { PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 const BODY_RADIUS = 26
@@ -34,29 +34,54 @@ async function main() {
   const debugBtn = document.getElementById('debugBtn') as HTMLButtonElement
   const addBtn = document.getElementById('addBtn') as HTMLButtonElement
   const clearBtn = document.getElementById('clearBtn') as HTMLButtonElement
-  const bgBtn = document.getElementById('bgBtn') as HTMLButtonElement
   const bgPicker = document.getElementById('bgPicker') as HTMLInputElement
   const depthBtn = document.getElementById('depthBtn') as HTMLButtonElement
   const depthIPInput = document.getElementById('depthIP') as HTMLInputElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
   let debugMode = false
-  let bgEnabled = false
   let bgColor = '#00ff88'
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
-  let lastSeg: ImageSegmenterResult | null = null
   let lastDepthFrame: DepthFrame | null = null
   let depthThreshold = 2.5
   let prevTimestamp = 0
 
   // Depth camera receiver
   const depthReceiver = new DepthReceiver()
-  depthReceiver.onFrame = (frame) => { lastDepthFrame = frame }
+  let depthFrameDirty = false
+  let userDisconnectedDepth = false // explicit click, not a dropped connection — don't fight the user's own choice
+  let depthReconnectTimer: ReturnType<typeof setTimeout> | null = null
+  depthReceiver.onFrame = (frame) => {
+    // Each frame decodes a fresh ImageBitmap (GPU-backed) — close the previous
+    // one or they pile up faster than GC reclaims them and the tab grinds to a halt.
+    lastDepthFrame?.colorBitmap.close()
+    lastDepthFrame = frame
+    depthFrameDirty = true
+  }
   depthReceiver.onStatusChange = (connected) => {
     depthBtn.classList.toggle('active', connected)
     depthBtn.textContent = connected ? 'Depth: Connected' : 'Connect Depth Camera'
+    // Both onerror and onclose fire on a failed connection attempt — only
+    // ever have one reconnect timer pending at a time.
+    if (!connected && !userDisconnectedDepth && depthReconnectTimer === null) {
+      // Dropped unexpectedly (relay/sender restart, camera unplugged, etc.) —
+      // this runs unattended as a store display, so keep retrying rather than
+      // waiting for someone to notice and click the button again.
+      depthReconnectTimer = setTimeout(() => {
+        depthReconnectTimer = null
+        connectDepth()
+      }, 3000)
+    }
   }
+
+  function connectDepth() {
+    const ip = depthIPInput.value.trim()
+    if (!ip) return
+    userDisconnectedDepth = false
+    depthReceiver.connect(`ws://${ip}:8080/view`)
+  }
+  connectDepth()
 
   // Camera
   statusEl.textContent = 'Requesting camera...'
@@ -64,6 +89,7 @@ async function main() {
   video.autoplay = true
   video.playsInline = true
   video.muted = true
+  let hasWebcam = false
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -73,10 +99,12 @@ async function main() {
     video.srcObject = stream
     await new Promise<void>((res) => { video.onloadedmetadata = () => res() })
     await video.play()
+    hasWebcam = true
   } catch {
-    loadingMsg.textContent = 'Camera access denied — please allow camera and reload.'
-    statusEl.textContent = 'Camera unavailable'
-    return
+    // No local webcam (or it's claimed elsewhere, e.g. by the depth camera's own
+    // sender process) — carry on and rely on the depth camera's own color feed
+    // for both tracking and the mirror image once it's connected.
+    statusEl.textContent = 'No local camera — connect a depth camera from the settings menu'
   }
 
   // Physics
@@ -134,7 +162,7 @@ async function main() {
   }
 
   loadingEl.style.display = 'none'
-  statusEl.textContent = 'Tracking active'
+  statusEl.textContent = hasWebcam ? 'Tracking active' : 'No local camera — connect a depth camera from the settings menu'
 
   // Fade out hint after 8s
   setTimeout(() => {
@@ -161,19 +189,16 @@ async function main() {
     for (let i = 0; i < toAdd; i++) spawnNext()
   })
   clearBtn.addEventListener('click', () => physics.clearObjects())
-  bgBtn.addEventListener('click', () => {
-    bgEnabled = !bgEnabled
-    bgBtn.classList.toggle('active', bgEnabled)
-  })
   bgPicker.addEventListener('input', () => { bgColor = bgPicker.value })
   depthBtn.addEventListener('click', () => {
     if (depthReceiver.connected) {
+      userDisconnectedDepth = true
       depthReceiver.disconnect()
       lastDepthFrame = null
+    } else if (!depthIPInput.value.trim()) {
+      depthIPInput.focus()
     } else {
-      const ip = depthIPInput.value.trim()
-      if (!ip) { depthIPInput.focus(); return }
-      depthReceiver.connect(`ws://${ip}:8080/view`)
+      connectDepth()
     }
   })
 
@@ -243,18 +268,55 @@ async function main() {
   const grabbing = new Map<number, boolean>()
   const hoverObjects = new Set<import('./physics').FloatingObject>()
 
+  // Downscaled copy of the depth camera's color frame fed to MediaPipe — pose/hand
+  // landmark accuracy doesn't need full 1280x720, and cutting the pixel count this
+  // much (~5x) cuts model inference cost by roughly the same factor.
+  const trackCanvas = document.createElement('canvas')
+  trackCanvas.width = 640
+  trackCanvas.height = 360
+  const trackCtx = trackCanvas.getContext('2d')!
+
   function loop(ts: number) {
     const dt = Math.min(ts - prevTimestamp, 50)
     prevTimestamp = ts
 
     // --- Tracking ---
-    const result = tracker.detect(video, ts)
+    // Prefer the depth camera's own color feed (it's the only camera on machines
+    // where a separate webcam isn't available / is claimed by the depth sender);
+    // fall back to a local webcam if one was granted. The depth feed only updates
+    // ~20-25fps over the WebSocket while rAF runs ~60fps — re-running pose/hand
+    // detection on the same still bitmap between arrivals is pure wasted GPU work
+    // that compounds frame over frame, so skip detection until a fresh frame has
+    // actually arrived (a real <video> element paces itself, no flag needed).
+    const usingDepthSource = lastDepthFrame !== null
+    let trackingSource: TexImageSource | null = null
+    if (usingDepthSource) {
+      // Crop identically to what's actually displayed (see drawWithDepth in
+      // renderer.ts) — otherwise landmarks are computed against the full
+      // frame while the video they're overlaid on is a zoomed-in crop of it,
+      // throwing the skeleton off by however much the crop offsets things.
+      const cov = getDepthCoverageRect()
+      if (cov) {
+        trackCtx.drawImage(
+          lastDepthFrame!.colorBitmap,
+          cov.x0, cov.y0, cov.x1 - cov.x0, cov.y1 - cov.y0,
+          0, 0, trackCanvas.width, trackCanvas.height,
+        )
+      } else {
+        // First frame or two, before drawWithDepth has detected the coverage
+        // rect yet — use the uncropped frame rather than block on it.
+        trackCtx.drawImage(lastDepthFrame!.colorBitmap, 0, 0, trackCanvas.width, trackCanvas.height)
+      }
+      trackingSource = trackCanvas
+    } else if (hasWebcam) {
+      trackingSource = video
+    }
+    const shouldDetect = trackingSource && (!usingDepthSource || depthFrameDirty)
+    if (usingDepthSource) depthFrameDirty = false
+    const result = shouldDetect ? tracker.detect(trackingSource!, ts) : null
     if (result) {
-      // Release WebGL textures held by previous segmentation masks
-      lastSeg?.confidenceMasks?.forEach(m => m.close())
       lastPose = result.pose
       lastHands = result.hands
-      lastSeg = result.segmentation
     }
 
     // --- Pose → physics bodies ---
@@ -423,7 +485,7 @@ async function main() {
     }
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, depthThreshold, PRODUCT_INFO)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, bgColor, lastDepthFrame, depthThreshold, PRODUCT_INFO)
 
     requestAnimationFrame(loop)
   }
