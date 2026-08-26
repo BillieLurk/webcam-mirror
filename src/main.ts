@@ -1,8 +1,10 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
+import { RVMSegmenter } from './segmenter'
 import { PhysicsScene } from './physics'
 import { renderFrame, captureBgFrame } from './renderer'
 import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
-import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
+import type { PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
+import type { AlphaMask } from './segmenter'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 const BODY_RADIUS = 26
@@ -42,7 +44,7 @@ async function main() {
   let bgColor = '#00ff88'
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
-  let lastSeg: ImageSegmenterResult | null = null
+  let lastSeg: AlphaMask | null = null
   let bgSubThreshold = 35
   let bgSubAdaptRate = 0.002
   let prevTimestamp = 0
@@ -113,7 +115,7 @@ async function main() {
   }
   for (let i = 0; i < MAX_OBJECTS; i++) spawnNext()
 
-  // MediaPipe
+  // MediaPipe pose + hands
   const tracker = new Tracker()
   try {
     await tracker.init((msg) => { loadingMsg.textContent = msg })
@@ -121,6 +123,13 @@ async function main() {
     loadingMsg.textContent = `Model load failed: ${(err as Error).message}`
     return
   }
+
+  // RVM segmenter (loads separately — non-blocking after pose+hands are ready)
+  const segmenter = new RVMSegmenter()
+  segmenter.init((msg) => { statusEl.textContent = msg }).catch((err) => {
+    console.warn('RVM segmenter failed to load, bg replacement unavailable:', err)
+    statusEl.textContent = 'Segmenter unavailable'
+  })
 
   loadingEl.style.display = 'none'
   statusEl.textContent = 'Tracking active'
@@ -235,12 +244,12 @@ async function main() {
     // --- Tracking ---
     const result = tracker.detect(video, ts)
     if (result) {
-      // Release WebGL textures held by previous segmentation masks
-      lastSeg?.confidenceMasks?.forEach(m => m.close())
       lastPose = result.pose
       lastHands = result.hands
-      lastSeg = result.segmentation
     }
+
+    // --- RVM segmentation (async, runs every frame) ---
+    segmenter.segment(video).then(mask => { if (mask) lastSeg = mask })
 
     // --- Pose → physics bodies ---
     if (lastPose && lastPose.landmarks.length > 0) {

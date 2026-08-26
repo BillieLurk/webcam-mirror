@@ -1,6 +1,7 @@
-import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
+import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
 import type { FloatingObject } from './physics'
 import type { ImageInfo, ProductInfo } from './assets'
+import type { AlphaMask } from './segmenter'
 import { detectFist, getPalmCenter } from './tracker'
 
 // Offscreen canvases for background replacement compositing, lazily created
@@ -67,7 +68,7 @@ export function hasBgModel(): boolean { return bgModel !== null }
 function drawWithBgSub(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
-  segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
+  segmentation: AlphaMask | null,
   bgColor: string,
   W: number,
   H: number,
@@ -79,15 +80,10 @@ function drawWithBgSub(
   const [bgR, bgG, bgB] = parseCssColor(bgColor)
   const numPx = W * H
 
-  // MediaPipe mask — bilinear sampled per pixel
-  let maskArr: Float32Array | null = null
-  let maskW = 0, maskH = 0
-  if (segmentation?.confidenceMasks?.length) {
-    const m = segmentation.confidenceMasks[0]
-    maskArr = m.getAsFloat32Array()
-    maskW = m.width
-    maskH = m.height
-  }
+  // RVM alpha mask — bilinear sampled per pixel
+  const maskArr = segmentation?.data ?? null
+  const maskW = segmentation?.width ?? 0
+  const maskH = segmentation?.height ?? 0
 
   // Auto-initialise model from the first frame if not yet captured
   if (!bgModel || bgModel.length !== numPx * 3) {
@@ -172,7 +168,7 @@ function drawWithBgSub(
 function drawWithSegmentation(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
-  segmentation: { confidenceMasks?: Array<{ getAsFloat32Array(): Float32Array; width: number; height: number }> },
+  segmentation: AlphaMask,
   bgColor: string,
   W: number,
   H: number,
@@ -180,10 +176,9 @@ function drawWithSegmentation(
   const imageData = captureVideoFrame(video, W, H)
   const pixels = imageData.data
 
-  const maskImg = segmentation.confidenceMasks![0]
-  const maskArr = maskImg.getAsFloat32Array()
-  const maskW = maskImg.width
-  const maskH = maskImg.height
+  const maskArr = segmentation.data
+  const maskW = segmentation.width
+  const maskH = segmentation.height
   const [bgR, bgG, bgB] = parseCssColor(bgColor)
 
   for (let cy = 0; cy < H; cy++) {
@@ -284,7 +279,7 @@ export function renderFrame(
   grabbing: Map<number, boolean>,
   hoverObjects: Set<FloatingObject>,
   images: Map<string, ImageInfo>,
-  segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
+  segmentation: AlphaMask | null,
   bgColor: string,
   bgEnabled: boolean,
   bgSubThreshold: number,
@@ -296,10 +291,10 @@ export function renderFrame(
   ctx.clearRect(0, 0, W, H)
 
   if (bgEnabled && bgModel) {
-    // Combined path: bg subtraction × MediaPipe (best quality)
+    // Combined path: BG subtraction + RVM veto (sharpest edges)
     drawWithBgSub(ctx, video, segmentation, bgColor, W, H, bgSubThreshold, bgSubAdaptRate)
-  } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
-    // ML segmentation fallback: no bg model captured yet
+  } else if (bgEnabled && segmentation) {
+    // RVM-only fallback: no bg model captured yet
     drawWithSegmentation(ctx, video, segmentation, bgColor, W, H)
   } else {
     // Plain mirrored webcam

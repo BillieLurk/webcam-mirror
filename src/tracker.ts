@@ -1,30 +1,25 @@
 import {
   PoseLandmarker,
   HandLandmarker,
-  ImageSegmenter,
   FilesetResolver,
 } from '@mediapipe/tasks-vision'
 import type {
   NormalizedLandmark,
   PoseLandmarkerResult,
   HandLandmarkerResult,
-  ImageSegmenterResult,
 } from '@mediapipe/tasks-vision'
 
-export type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult }
+export type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult }
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
 const POSE_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task'
 const HAND_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task'
-const SEG_MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite'
 
 export class Tracker {
   private poseLandmarker: PoseLandmarker | null = null
   private handLandmarker: HandLandmarker | null = null
-  private imageSegmenter: ImageSegmenter | null = null
   private lastTimestamp = -1
 
   async init(onProgress?: (msg: string) => void): Promise<void> {
@@ -33,10 +28,7 @@ export class Tracker {
 
     onProgress?.('Loading pose model...')
     this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: POSE_MODEL_URL,
-        delegate: 'GPU',
-      },
+      baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate: 'GPU' },
       runningMode: 'VIDEO',
       numPoses: 1,
       minPoseDetectionConfidence: 0.5,
@@ -46,41 +38,25 @@ export class Tracker {
 
     onProgress?.('Loading hand tracking model...')
     this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: HAND_MODEL_URL,
-        delegate: 'GPU',
-      },
+      baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate: 'GPU' },
       runningMode: 'VIDEO',
       numHands: 2,
       minHandDetectionConfidence: 0.5,
       minHandPresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
     })
-
-    onProgress?.('Loading segmentation model...')
-    this.imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: SEG_MODEL_URL,
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      outputCategoryMask: false,
-      outputConfidenceMasks: true,
-    })
   }
 
   detect(
     video: HTMLVideoElement,
     timestamp: number,
-  ): { pose: PoseLandmarkerResult; hands: HandLandmarkerResult; segmentation: ImageSegmenterResult | null } | null {
-    if (!this.poseLandmarker || !this.handLandmarker || !this.imageSegmenter) return null
+  ): { pose: PoseLandmarkerResult; hands: HandLandmarkerResult } | null {
+    if (!this.poseLandmarker || !this.handLandmarker) return null
     if (timestamp === this.lastTimestamp) return null
     this.lastTimestamp = timestamp
-
     const pose = this.poseLandmarker.detectForVideo(video, timestamp)
     const hands = this.handLandmarker.detectForVideo(video, timestamp)
-    const segmentation = this.imageSegmenter.segmentForVideo(video, timestamp)
-    return { pose, hands, segmentation }
+    return { pose, hands }
   }
 
   isReady(): boolean {
