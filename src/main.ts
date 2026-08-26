@@ -1,9 +1,7 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
 import { PhysicsScene } from './physics'
-import { renderFrame } from './renderer'
-import { DepthReceiver } from './depth-receiver'
+import { renderFrame, captureBgFrame } from './renderer'
 import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
-import type { DepthFrame } from './depth-receiver'
 import type { PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
@@ -36,8 +34,7 @@ async function main() {
   const clearBtn = document.getElementById('clearBtn') as HTMLButtonElement
   const bgBtn = document.getElementById('bgBtn') as HTMLButtonElement
   const bgPicker = document.getElementById('bgPicker') as HTMLInputElement
-  const depthBtn = document.getElementById('depthBtn') as HTMLButtonElement
-  const depthIPInput = document.getElementById('depthIP') as HTMLInputElement
+  const captureBgBtn = document.getElementById('captureBgBtn') as HTMLButtonElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
   let debugMode = false
@@ -46,17 +43,9 @@ async function main() {
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
   let lastSeg: ImageSegmenterResult | null = null
-  let lastDepthFrame: DepthFrame | null = null
-  let depthThreshold = 2.5
+  let bgSubThreshold = 25
+  let bgSubAdaptRate = 0.003
   let prevTimestamp = 0
-
-  // Depth camera receiver
-  const depthReceiver = new DepthReceiver()
-  depthReceiver.onFrame = (frame) => { lastDepthFrame = frame }
-  depthReceiver.onStatusChange = (connected) => {
-    depthBtn.classList.toggle('active', connected)
-    depthBtn.textContent = connected ? 'Depth: Connected' : 'Connect Depth Camera'
-  }
 
   // Camera
   statusEl.textContent = 'Requesting camera...'
@@ -166,15 +155,10 @@ async function main() {
     bgBtn.classList.toggle('active', bgEnabled)
   })
   bgPicker.addEventListener('input', () => { bgColor = bgPicker.value })
-  depthBtn.addEventListener('click', () => {
-    if (depthReceiver.connected) {
-      depthReceiver.disconnect()
-      lastDepthFrame = null
-    } else {
-      const ip = depthIPInput.value.trim()
-      if (!ip) { depthIPInput.focus(); return }
-      depthReceiver.connect(`ws://${ip}:8080/view`)
-    }
+  captureBgBtn.addEventListener('click', () => {
+    captureBgFrame(video, canvas.width, canvas.height)
+    captureBgBtn.textContent = 'BG Captured ✓'
+    setTimeout(() => { captureBgBtn.textContent = 'Capture Background' }, 2000)
   })
 
   // --- Tuning panel: category size sliders + max objects ---
@@ -204,12 +188,13 @@ async function main() {
     return row
   }
 
-  // Depth threshold slider
-  const depthSection = document.createElement('div')
-  depthSection.className = 'tuning-section-label'
-  depthSection.textContent = 'Depth Camera'
-  tuningPanel.append(depthSection)
-  tuningPanel.append(makeSliderRow('BG cut (m)', depthThreshold, 0.5, 6.0, 0.1, v => { depthThreshold = v }))
+  // Background subtraction sliders
+  const bgSubSection = document.createElement('div')
+  bgSubSection.className = 'tuning-section-label'
+  bgSubSection.textContent = 'BG Subtraction'
+  tuningPanel.append(bgSubSection)
+  tuningPanel.append(makeSliderRow('Sensitivity', bgSubThreshold, 5, 80, 1, v => { bgSubThreshold = v }))
+  tuningPanel.append(makeSliderRow('Adapt speed', bgSubAdaptRate, 0.001, 0.02, 0.001, v => { bgSubAdaptRate = v }))
 
   // Max objects slider
   const maxObjSection = document.createElement('div')
@@ -423,7 +408,7 @@ async function main() {
     }
 
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, lastDepthFrame, depthThreshold, PRODUCT_INFO)
+    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, bgSubThreshold, bgSubAdaptRate, PRODUCT_INFO)
 
     requestAnimationFrame(loop)
   }

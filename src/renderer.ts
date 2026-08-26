@@ -1,6 +1,5 @@
 import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult, ImageSegmenterResult } from './tracker'
 import type { FloatingObject } from './physics'
-import type { DepthFrame } from './depth-receiver'
 import type { ImageInfo, ProductInfo } from './assets'
 import { detectFist, getPalmCenter } from './tracker'
 
@@ -8,8 +7,10 @@ import { detectFist, getPalmCenter } from './tracker'
 let offVideo: OffscreenCanvas | null = null
 let offVideoCtx: OffscreenCanvasRenderingContext2D | null = null
 
-// Temporal smoothing buffer for depth background alpha — reduces flicker between frames
-let prevDepthAlpha: Float32Array | null = null
+// Background subtraction model: RGB float per pixel (0-255 range)
+let bgModel: Float32Array | null = null
+// Temporal smoothing buffer: per-pixel bg alpha from previous frame
+let prevBgAlpha: Float32Array | null = null
 
 function ensureOffscreen(w: number, h: number) {
   if (!offVideo || offVideo.width !== w || offVideo.height !== h) {
@@ -18,16 +19,121 @@ function ensureOffscreen(w: number, h: number) {
   }
 }
 
-function sampleBilinear(arr: Float32Array, mw: number, mh: number, fx: number, fy: number): number {
-  const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, mw - 1)
-  const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, mh - 1)
-  const tx = fx - x0, ty = fy - y0
-  const v00 = arr[y0 * mw + x0], v10 = arr[y0 * mw + x1]
-  const v01 = arr[y1 * mw + x0], v11 = arr[y1 * mw + x1]
-  return (1 - ty) * ((1 - tx) * v00 + tx * v10) + ty * ((1 - tx) * v01 + tx * v11)
+/** Draw the mirrored video frame into the offscreen canvas and return its ImageData. */
+function captureVideoFrame(video: HTMLVideoElement, W: number, H: number): ImageData {
+  ensureOffscreen(W, H)
+  const oc = offVideoCtx!
+  oc.save()
+  oc.translate(W, 0)
+  oc.scale(-1, 1)
+  oc.drawImage(video, 0, 0, W, H)
+  oc.restore()
+  return oc.getImageData(0, 0, W, H)
 }
 
-function drawWithBackground(
+/**
+ * Snapshot the current video frame as the background model.
+ * Call this when no one is standing in frame.
+ */
+export function captureBgFrame(video: HTMLVideoElement, W: number, H: number) {
+  const { data } = captureVideoFrame(video, W, H)
+  const numPx = W * H
+  bgModel = new Float32Array(numPx * 3)
+  for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
+    bgModel[j]     = data[i]
+    bgModel[j + 1] = data[i + 1]
+    bgModel[j + 2] = data[i + 2]
+  }
+  prevBgAlpha = null  // reset temporal buffer after hard capture
+}
+
+export function hasBgModel(): boolean { return bgModel !== null }
+
+/**
+ * Adaptive background subtraction.
+ *
+ * Compares each pixel against a learned background model.
+ * Pixels that match the model are replaced with bgColor.
+ * Pixels that differ (the person) are kept.
+ *
+ * Background pixels slowly update the model at `adaptRate` per frame,
+ * so if the camera is nudged the background gradually re-learns itself.
+ * Foreground pixels never update the model, so the person never burns in.
+ */
+function drawWithBgSub(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  bgColor: string,
+  W: number,
+  H: number,
+  threshold: number,
+  adaptRate: number,
+) {
+  const imageData = captureVideoFrame(video, W, H)
+  const pixels = imageData.data
+  const [bgR, bgG, bgB] = parseCssColor(bgColor)
+  const numPx = W * H
+
+  // Auto-initialise model from the first frame if not yet captured
+  if (!bgModel || bgModel.length !== numPx * 3) {
+    bgModel = new Float32Array(numPx * 3)
+    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 3) {
+      bgModel[j] = pixels[i]; bgModel[j + 1] = pixels[i + 1]; bgModel[j + 2] = pixels[i + 2]
+    }
+    ctx.putImageData(imageData, 0, 0)
+    return
+  }
+
+  if (!prevBgAlpha || prevBgAlpha.length !== numPx) {
+    prevBgAlpha = new Float32Array(numPx)
+  }
+
+  const EDGE     = threshold * 0.35  // soft transition zone around the threshold
+  const TEMPORAL = 0.45              // how much of the previous frame's alpha to retain
+
+  for (let i = 0, j = 0, pi = 0; i < pixels.length; i += 4, j += 3, pi++) {
+    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
+    const mr = bgModel[j], mg = bgModel[j + 1], mb = bgModel[j + 2]
+
+    const dr = r - mr, dg = g - mg, db = b - mb
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+
+    // bgAlpha: 1 = background (replace with color), 0 = foreground (keep person)
+    let raw: number
+    if (dist < threshold - EDGE) {
+      raw = 1  // clearly background
+    } else if (dist > threshold + EDGE) {
+      raw = 0  // clearly foreground
+    } else {
+      const t = (dist - (threshold - EDGE)) / (2 * EDGE)
+      raw = 1 - t * t * (3 - 2 * t)  // smoothstep, 1→0 as dist crosses threshold
+    }
+
+    // Temporal smoothing: blend with previous alpha to suppress per-frame flicker
+    const alpha = prevBgAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
+    prevBgAlpha[pi] = alpha
+
+    // Adapt background model only for background-classified pixels
+    if (raw > 0.5) {
+      bgModel[j]     += (r - bgModel[j])     * adaptRate
+      bgModel[j + 1] += (g - bgModel[j + 1]) * adaptRate
+      bgModel[j + 2] += (b - bgModel[j + 2]) * adaptRate
+    }
+
+    if (alpha > 0.005) {
+      pixels[i]     = ((r * (1 - alpha)) + bgR * alpha) | 0
+      pixels[i + 1] = ((g * (1 - alpha)) + bgG * alpha) | 0
+      pixels[i + 2] = ((b * (1 - alpha)) + bgB * alpha) | 0
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0)
+}
+
+/**
+ * ML segmentation fallback — used when no bg model has been captured.
+ */
+function drawWithSegmentation(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,
   segmentation: { confidenceMasks?: Array<{ getAsFloat32Array(): Float32Array; width: number; height: number }> },
@@ -35,119 +141,33 @@ function drawWithBackground(
   W: number,
   H: number,
 ) {
-  ensureOffscreen(W, H)
-  const oc = offVideoCtx!
+  const imageData = captureVideoFrame(video, W, H)
+  const pixels = imageData.data
 
-  // Draw mirrored video into offscreen canvas
-  oc.save()
-  oc.translate(W, 0)
-  oc.scale(-1, 1)
-  oc.drawImage(video, 0, 0, W, H)
-  oc.restore()
-
-  const videoData = oc.getImageData(0, 0, W, H)
-  const pixels = videoData.data
-
-  // confidenceMasks[0] = person confidence (class 0), 1.0 = definitely person
   const maskImg = segmentation.confidenceMasks![0]
   const maskArr = maskImg.getAsFloat32Array()
   const maskW = maskImg.width
   const maskH = maskImg.height
-
-  const bg = parseCssColor(bgColor)
+  const [bgR, bgG, bgB] = parseCssColor(bgColor)
 
   for (let cy = 0; cy < H; cy++) {
-    // Un-mirror x: canvas left = video right
     const fy = (cy / H) * maskH
     for (let cx = 0; cx < W; cx++) {
+      // Bilinear sample into mask (un-mirrored x since video is already mirrored)
       const videoX = W - 1 - cx
       const fx = (videoX / W) * maskW
-
-      // Bilinear sample gives a smooth gradient at person edges
-      const personConf = sampleBilinear(maskArr, maskW, maskH, fx, fy)
+      const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, maskW - 1)
+      const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, maskH - 1)
+      const tx = fx - x0, ty = fy - y0
+      const personConf =
+        (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
+        ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
       const bgAlpha = 1 - personConf
-
       if (bgAlpha > 0) {
         const pi = (cy * W + cx) * 4
-        pixels[pi]     = (pixels[pi]     * personConf + bg[0] * bgAlpha) | 0
-        pixels[pi + 1] = (pixels[pi + 1] * personConf + bg[1] * bgAlpha) | 0
-        pixels[pi + 2] = (pixels[pi + 2] * personConf + bg[2] * bgAlpha) | 0
-      }
-    }
-  }
-
-  ctx.putImageData(videoData, 0, 0)
-}
-
-/**
- * Depth-camera compositing path.
- * The iPhone sends its own color frame (already the right source of truth)
- * alongside per-pixel depth in metres. Pixels beyond `threshold` metres are
- * replaced with the solid background color.
- *
- * The color frame is landscape from the rear camera so we rotate it 90°
- * by drawing it transposed onto an offscreen canvas.
- */
-function drawWithDepth(
-  ctx: CanvasRenderingContext2D,
-  frame: DepthFrame,
-  bgColor: string,
-  W: number,
-  H: number,
-  threshold: number,
-) {
-  ensureOffscreen(W, H)
-  const oc = offVideoCtx!
-
-  // Draw the iPhone color frame scaled to canvas (it arrives as landscape bitmap)
-  oc.clearRect(0, 0, W, H)
-  oc.drawImage(frame.colorBitmap, 0, 0, W, H)
-
-  const imageData = oc.getImageData(0, 0, W, H)
-  const pixels = imageData.data
-  const bg = parseCssColor(bgColor)
-
-  const { depthData, depthWidth: dw, depthHeight: dh } = frame
-
-  const THRESHOLD = threshold  // metres — person closer than this is kept
-  const EDGE      = 0.3  // soft transition zone width (metres either side of threshold)
-  const TEMPORAL  = 0.55 // how much of the previous frame's alpha to blend in (0=none, higher=smoother)
-
-  const numPixels = W * H
-  if (!prevDepthAlpha || prevDepthAlpha.length !== numPixels) {
-    prevDepthAlpha = new Float32Array(numPixels)
-  }
-
-  for (let cy = 0; cy < H; cy++) {
-    const fy = (cy / H) * dh
-    for (let cx = 0; cx < W; cx++) {
-      const fx = (cx / W) * dw
-      const depth = sampleBilinear(depthData, dw, dh, fx, fy)
-
-      // Raw background alpha: 0 = fully person, 1 = fully background
-      let raw: number
-      if (depth === 0) {
-        raw = 1  // no sensor data → background
-      } else if (depth < THRESHOLD - EDGE) {
-        raw = 0  // clearly in front
-      } else if (depth > THRESHOLD + EDGE) {
-        raw = 1  // clearly behind
-      } else {
-        // Smooth S-curve across the edge zone
-        const t = (depth - (THRESHOLD - EDGE)) / (2 * EDGE)
-        raw = t * t * (3 - 2 * t)  // smoothstep
-      }
-
-      // Temporal blend: mix with previous frame to suppress flicker
-      const pi = cy * W + cx
-      const alpha = prevDepthAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
-      prevDepthAlpha[pi] = alpha
-
-      if (alpha > 0.01) {
-        const idx = pi * 4
-        pixels[idx]     = ((pixels[idx]     * (1 - alpha)) + bg[0] * alpha) | 0
-        pixels[idx + 1] = ((pixels[idx + 1] * (1 - alpha)) + bg[1] * alpha) | 0
-        pixels[idx + 2] = ((pixels[idx + 2] * (1 - alpha)) + bg[2] * alpha) | 0
+        pixels[pi]     = (pixels[pi]     * personConf + bgR * bgAlpha) | 0
+        pixels[pi + 1] = (pixels[pi + 1] * personConf + bgG * bgAlpha) | 0
+        pixels[pi + 2] = (pixels[pi + 2] * personConf + bgB * bgAlpha) | 0
       }
     }
   }
@@ -225,20 +245,20 @@ export function renderFrame(
   segmentation: Pick<ImageSegmenterResult, 'confidenceMasks'> | null,
   bgColor: string,
   bgEnabled: boolean,
-  depthFrame: DepthFrame | null,
-  depthThreshold: number,
+  bgSubThreshold: number,
+  bgSubAdaptRate: number,
   productInfo: Record<string, ProductInfo>,
 ) {
   const { width: W, height: H } = ctx.canvas
 
   ctx.clearRect(0, 0, W, H)
 
-  if (depthFrame) {
-    // Depth camera path: use iPhone color + depth for background removal
-    drawWithDepth(ctx, depthFrame, bgColor, W, H, depthThreshold)
+  if (bgEnabled && bgModel) {
+    // Bg subtraction path: model has been captured, use it
+    drawWithBgSub(ctx, video, bgColor, W, H, bgSubThreshold, bgSubAdaptRate)
   } else if (bgEnabled && segmentation?.confidenceMasks?.length) {
-    // ML segmentation path: webcam + MediaPipe confidence mask
-    drawWithBackground(ctx, video, segmentation, bgColor, W, H)
+    // ML segmentation fallback: no bg model captured yet
+    drawWithSegmentation(ctx, video, segmentation, bgColor, W, H)
   } else {
     // Plain mirrored webcam
     ctx.save()

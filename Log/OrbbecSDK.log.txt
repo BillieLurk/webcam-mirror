@@ -1,0 +1,42 @@
+[08/25 15:25:50.436132][info][84570738][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/25 15:25:50.436288][warning][84570738][UsbEnumeratorLibusb.cpp:377] Femto Bolt is unavailable on macOS duo to Depth Engine
+[08/25 15:25:50.436325][info][84570738][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[08/25 15:25:50.436353][info][84570738][DeviceManager.cpp:25] Current found device(s): (0)
+[08/25 15:25:50.436399][info][84570738][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/25 15:25:51.441764][info][84570738][DeviceManager.cpp:25] Current device(s) list: (0)
+[08/25 15:25:51.441825][warning][84570738][ObException.cpp:32] A unrecoverable_exception has occurred!
+ - where: Pipeline.cpp(22)
+ - msg: No device found
+ - type: CAMERA_DISCONNECTED
+ - status: 112
+[08/25 15:26:24.617805][info][84572221][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/25 15:26:24.617940][warning][84572221][UsbEnumeratorLibusb.cpp:377] Femto Bolt is unavailable on macOS duo to Depth Engine
+[08/25 15:26:24.617985][info][84572221][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[08/25 15:26:24.618012][info][84572221][DeviceManager.cpp:25] Current found device(s): (0)
+[08/25 15:26:24.618034][info][84572221][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/25 15:26:25.643914][info][84572221][DeviceManager.cpp:25] Current device(s) list: (0)
+[08/25 15:26:46.815321][info][84573100][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/25 15:26:51.409136][info][84573249][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/25 15:26:51.421986][debug][84573249][DeviceManager.cpp:52] DeviceManager init ...
+[08/25 15:26:51.422040][debug][84573249][DeviceManager.cpp:58] Enable USB Device Enumerator ...
+[08/25 15:26:51.422089][warning][84573249][UsbEnumeratorLibusb.cpp:377] Femto Bolt is unavailable on macOS duo to Depth Engine
+[08/25 15:26:51.422112][debug][84573249][UsbEnumeratorLibusb.cpp:451] queryUsbInterfaces done!
+[08/25 15:26:51.422144][info][84573249][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[08/25 15:26:51.422175][debug][84573249][UsbDeviceEnumerator.cpp:58] No matched usb device found!
+[08/25 15:26:51.422204][info][84573249][DeviceManager.cpp:25] Current found device(s): (0)
+[08/25 15:26:51.422224][debug][84573249][DeviceManager.cpp:78] DeviceManager construct done!
+[08/25 15:26:51.422253][info][84573249][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/25 15:26:52.429756][debug][84573249][NetDeviceEnumerator.cpp:66] No net source port found!
+[08/25 15:26:52.429857][debug][84573249][NetDeviceEnumerator.cpp:38] No net device found!
+[08/25 15:26:52.429952][info][84573249][DeviceManager.cpp:25] Current device(s) list: (0)
+[08/25 15:26:52.432309][debug][84573249][DeviceManager.cpp:82] DeviceManager destroy ...
+[08/25 15:26:53.438157][debug][84573249][UsbEnumeratorLibusb.cpp:488] UsbEnumeratorLibusb::stopEventHandler()
+[08/25 15:26:53.438478][debug][84573249][UsbEnumeratorLibusb.cpp:349] UsbEnumeratorLibusb destroyed
+[08/25 15:26:53.438516][debug][84573249][DeviceManager.cpp:95] DeviceManager Destructors done
+[08/25 15:26:53.438535][debug][84573255][GVCPClient.cpp:463] bind 0.0.0.0:62575 [**9 logs in 2029ms, last: 15:26:51.409111**]
+[08/25 15:30:12.179410][info][84582986][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/25 15:30:12.179726][warning][84582986][UsbEnumeratorLibusb.cpp:377] Femto Bolt is unavailable on macOS duo to Depth Engine
+[08/25 15:30:12.179769][info][84582986][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[08/25 15:30:12.179793][info][84582986][DeviceManager.cpp:25] Current found device(s): (0)
+[08/25 15:30:12.179819][info][84582986][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/25 15:30:13.196981][info][84582986][DeviceManager.cpp:25] Current device(s) list: (0)
