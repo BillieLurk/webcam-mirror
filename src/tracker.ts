@@ -48,14 +48,14 @@ export class Tracker {
   }
 
   detect(
-    video: HTMLVideoElement,
+    source: HTMLVideoElement | HTMLCanvasElement,
     timestamp: number,
   ): { pose: PoseLandmarkerResult; hands: HandLandmarkerResult } | null {
     if (!this.poseLandmarker || !this.handLandmarker) return null
     if (timestamp === this.lastTimestamp) return null
     this.lastTimestamp = timestamp
-    const pose = this.poseLandmarker.detectForVideo(video, timestamp)
-    const hands = this.handLandmarker.detectForVideo(video, timestamp)
+    const pose = this.poseLandmarker.detectForVideo(source as HTMLVideoElement, timestamp)
+    const hands = this.handLandmarker.detectForVideo(source as HTMLVideoElement, timestamp)
     return { pose, hands }
   }
 

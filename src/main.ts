@@ -1,7 +1,8 @@
 import { Tracker, detectFist, getPalmCenter } from './tracker'
+import screensaverSlides from 'virtual:screensavers'
 import { RVMSegmenter } from './segmenter'
 import { PhysicsScene } from './physics'
-import { renderFrame, captureBgFrame } from './renderer'
+import { renderFrame } from './renderer'
 import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
 import type { PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
 import type { AlphaMask } from './segmenter'
@@ -32,22 +33,53 @@ async function main() {
   const loadingEl = document.getElementById('loading') as HTMLDivElement
   const loadingMsg = document.getElementById('loading-msg') as HTMLDivElement
   const debugBtn = document.getElementById('debugBtn') as HTMLButtonElement
+  const portraitCamBtn = document.getElementById('portraitCamBtn') as HTMLButtonElement
+  const flipVBtn = document.getElementById('flipVBtn') as HTMLButtonElement
+  const flipHBtn = document.getElementById('flipHBtn') as HTMLButtonElement
+  const screensaverBtn = document.getElementById('screensaverBtn') as HTMLButtonElement
   const addBtn = document.getElementById('addBtn') as HTMLButtonElement
   const clearBtn = document.getElementById('clearBtn') as HTMLButtonElement
   const bgBtn = document.getElementById('bgBtn') as HTMLButtonElement
   const bgPicker = document.getElementById('bgPicker') as HTMLInputElement
-  const captureBgBtn = document.getElementById('captureBgBtn') as HTMLButtonElement
   const hintEl = document.getElementById('hint') as HTMLDivElement
 
-  let debugMode = false
-  let bgEnabled = false
-  let bgColor = '#00ff88'
+  // --- Persist settings in localStorage ---
+  const LS = {
+    get: (k: string) => localStorage.getItem('dm_' + k),
+    set: (k: string, v: string) => localStorage.setItem('dm_' + k, v),
+    del: (k: string) => localStorage.removeItem('dm_' + k),
+  }
+
+  let debugMode = LS.get('debugMode') === '1'
+  let bgEnabled = LS.get('bgEnabled') === '1'
+  let portraitCam = LS.get('portraitCam') === '1'
+  let flipV = LS.get('flipV') === '1'
+  let flipH = LS.get('flipH') !== '0'  // default on (mirror mode)
+  let screensaverEnabled = LS.get('screensaverEnabled') !== '0'
+  let bgColor = LS.get('bgColor') ?? '#00ff88'
+  let bgImage: HTMLImageElement | null = null
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
   let lastSeg: AlphaMask | null = null
-  let bgSubThreshold = 35
-  let bgSubAdaptRate = 0.002
   let prevTimestamp = 0
+  let segmentPending = false
+  let personAbsentMs = 0
+  let screensaverAlpha = 0
+  let frameCount = 0
+
+  // Restore saved background image
+  const savedImg = LS.get('bgImage')
+  if (savedImg) {
+    const img = new Image()
+    img.src = savedImg
+    img.onload = () => { bgImage = img }
+  }
+
+  // Screensaver — single static image
+  const screensaverOverlay = document.getElementById('screensaverOverlay') as HTMLDivElement
+  const ssSlideA = document.getElementById('ssSlideA') as HTMLImageElement
+
+  if (screensaverSlides.length > 0) ssSlideA.src = screensaverSlides[0]
 
   // Camera
   statusEl.textContent = 'Requesting camera...'
@@ -56,19 +88,47 @@ async function main() {
   video.playsInline = true
   video.muted = true
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
-      audio: false,
-    })
-    video.srcObject = stream
+  let rawStream: MediaStream | null = null
+  // Canvas-based rotation: when portraitCam is on, we draw the video rotated into rotCanvas
+  // each frame and feed that to the tracker/segmenter instead of the raw video element.
+  // streamRotated = true means the source fed to tracker/segmenter is already upright.
+  let rotCanvas: HTMLCanvasElement | null = null
+  let rotCtx: CanvasRenderingContext2D | null = null
+  let streamRotated = false
+
+  async function setupCamera(applyRotation: boolean): Promise<boolean> {
+    if (rawStream) rawStream.getTracks().forEach(t => t.stop())
+    try {
+      rawStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        audio: false,
+      })
+    } catch {
+      loadingMsg.textContent = 'Camera access denied — please allow camera and reload.'
+      statusEl.textContent = 'Camera unavailable'
+      return false
+    }
+    video.srcObject = rawStream
     await new Promise<void>((res) => { video.onloadedmetadata = () => res() })
     await video.play()
-  } catch {
-    loadingMsg.textContent = 'Camera access denied — please allow camera and reload.'
-    statusEl.textContent = 'Camera unavailable'
-    return
+    if (applyRotation) {
+      // Create an off-screen canvas with swapped dimensions (landscape video → portrait canvas)
+      const vW = video.videoWidth, vH = video.videoHeight
+      rotCanvas = document.createElement('canvas')
+      rotCanvas.width = vH   // portrait: height becomes width
+      rotCanvas.height = vW
+      rotCtx = rotCanvas.getContext('2d')!
+      streamRotated = true
+    } else {
+      rotCanvas = null
+      rotCtx = null
+      streamRotated = false
+    }
+    return true
   }
+
+  const ok = await setupCamera(portraitCam)
+  if (!ok) return
 
   // Physics
   const physics = new PhysicsScene(window.innerWidth, window.innerHeight)
@@ -126,13 +186,19 @@ async function main() {
 
   // RVM segmenter (loads separately — non-blocking after pose+hands are ready)
   const segmenter = new RVMSegmenter()
-  segmenter.init((msg) => { statusEl.textContent = msg }).catch((err) => {
-    console.warn('RVM segmenter failed to load, bg replacement unavailable:', err)
-    statusEl.textContent = 'Segmenter unavailable'
-  })
-
   loadingEl.style.display = 'none'
   statusEl.textContent = 'Tracking active'
+  bgBtn.textContent = 'Replace Background (loading…)'
+  bgBtn.disabled = true
+  segmenter.init((msg) => { statusEl.textContent = msg }).then(() => {
+    statusEl.textContent = `Ready · seg: ${segmenter.backend}`
+    bgBtn.textContent = 'Replace Background'
+    bgBtn.disabled = false
+  }).catch((err) => {
+    console.error('RVM segmenter failed:', err)
+    bgBtn.textContent = 'Replace Background (unavailable)'
+    statusEl.textContent = 'Segmenter unavailable'
+  })
 
   // Fade out hint after 8s
   setTimeout(() => {
@@ -142,6 +208,18 @@ async function main() {
 
   // UI — menu hidden by default, toggled via the settings button
   const uiEl = document.getElementById('ui') as HTMLDivElement
+  const fullscreenBtn = document.getElementById('fullscreenBtn') as HTMLButtonElement
+  fullscreenBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen()
+    } else {
+      document.exitFullscreen()
+    }
+  })
+  document.addEventListener('fullscreenchange', () => {
+    fullscreenBtn.textContent = document.fullscreenElement ? '✕' : '⛶'
+  })
+
   const menuBtn = document.getElementById('menuBtn') as HTMLButtonElement
   let menuOpen = false
   menuBtn.addEventListener('click', () => {
@@ -150,9 +228,46 @@ async function main() {
     menuBtn.classList.toggle('active', menuOpen)
   })
 
+  // Restore button states from saved settings
+  debugBtn.classList.toggle('active', debugMode)
+  portraitCamBtn.classList.toggle('active', portraitCam)
+  flipVBtn.classList.toggle('active', flipV)
+  flipHBtn.classList.toggle('active', flipH)
+  screensaverBtn.classList.toggle('active', screensaverEnabled)
+  bgBtn.classList.toggle('active', bgEnabled)
+  bgPicker.value = bgColor
+
   debugBtn.addEventListener('click', () => {
     debugMode = !debugMode
     debugBtn.classList.toggle('active', debugMode)
+    LS.set('debugMode', debugMode ? '1' : '0')
+  })
+  portraitCamBtn.addEventListener('click', async () => {
+    portraitCam = !portraitCam
+    portraitCamBtn.classList.toggle('active', portraitCam)
+    LS.set('portraitCam', portraitCam ? '1' : '0')
+    await setupCamera(portraitCam)
+    segmenter.resetState()
+  })
+  flipVBtn.addEventListener('click', () => {
+    flipV = !flipV
+    flipVBtn.classList.toggle('active', flipV)
+    LS.set('flipV', flipV ? '1' : '0')
+  })
+  flipHBtn.addEventListener('click', () => {
+    flipH = !flipH
+    flipHBtn.classList.toggle('active', flipH)
+    LS.set('flipH', flipH ? '1' : '0')
+  })
+  screensaverBtn.addEventListener('click', () => {
+    screensaverEnabled = !screensaverEnabled
+    screensaverBtn.classList.toggle('active', screensaverEnabled)
+    LS.set('screensaverEnabled', screensaverEnabled ? '1' : '0')
+    if (!screensaverEnabled) {
+      personAbsentMs = 0
+      screensaverAlpha = 0
+      screensaverOverlay.style.opacity = '0'
+    }
   })
   addBtn.addEventListener('click', () => {
     const toAdd = MAX_OBJECTS - physics.floatingObjects.length
@@ -162,13 +277,61 @@ async function main() {
   bgBtn.addEventListener('click', () => {
     bgEnabled = !bgEnabled
     bgBtn.classList.toggle('active', bgEnabled)
+    LS.set('bgEnabled', bgEnabled ? '1' : '0')
   })
-  bgPicker.addEventListener('input', () => { bgColor = bgPicker.value })
-  captureBgBtn.addEventListener('click', () => {
-    captureBgFrame(video, canvas.width, canvas.height)
-    captureBgBtn.textContent = 'BG Captured ✓'
-    setTimeout(() => { captureBgBtn.textContent = 'Capture Background' }, 2000)
+  bgPicker.addEventListener('input', () => {
+    bgColor = bgPicker.value
+    LS.set('bgColor', bgColor)
   })
+
+  // Background image upload
+  const bgImageInput = document.getElementById('bgImageInput') as HTMLInputElement
+  const bgImageBtn = document.getElementById('bgImageBtn') as HTMLButtonElement
+  const clearBgImageBtn = document.getElementById('clearBgImageBtn') as HTMLButtonElement
+
+  function updateBgImageBtn() {
+    bgImageBtn.textContent = bgImage ? 'BG Image ✓' : 'Upload BG Image'
+    bgImageBtn.classList.toggle('active', bgImage !== null)
+    clearBgImageBtn.style.display = bgImage ? 'inline-block' : 'none'
+  }
+  updateBgImageBtn()
+
+  bgImageBtn.addEventListener('click', () => bgImageInput.click())
+  bgImageInput.addEventListener('change', () => {
+    const file = bgImageInput.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const dataUrl = e.target!.result as string
+      const img = new Image()
+      img.onload = () => {
+        // Resize to max 1280×720 JPEG before storing to stay within localStorage limits
+        const scale = Math.min(1, 1280 / img.naturalWidth, 720 / img.naturalHeight)
+        const w = Math.round(img.naturalWidth * scale)
+        const h = Math.round(img.naturalHeight * scale)
+        const c = document.createElement('canvas')
+        c.width = w; c.height = h
+        c.getContext('2d')!.drawImage(img, 0, 0, w, h)
+        const compressed = c.toDataURL('image/jpeg', 0.85)
+        const out = new Image()
+        out.src = compressed
+        out.onload = () => {
+          bgImage = out
+          try { LS.set('bgImage', compressed) } catch { /* quota exceeded */ }
+          updateBgImageBtn()
+        }
+      }
+      img.src = dataUrl
+    }
+    reader.readAsDataURL(file)
+    bgImageInput.value = ''
+  })
+  clearBgImageBtn.addEventListener('click', () => {
+    bgImage = null
+    LS.del('bgImage')
+    updateBgImageBtn()
+  })
+
 
   // --- Tuning panel: category size sliders + max objects ---
   const tuningPanel = document.getElementById('tuningPanel') as HTMLDivElement
@@ -196,14 +359,6 @@ async function main() {
     row.append(lbl, slider, val)
     return row
   }
-
-  // Background subtraction sliders
-  const bgSubSection = document.createElement('div')
-  bgSubSection.className = 'tuning-section-label'
-  bgSubSection.textContent = 'BG Subtraction'
-  tuningPanel.append(bgSubSection)
-  tuningPanel.append(makeSliderRow('Sensitivity', bgSubThreshold, 5, 80, 1, v => { bgSubThreshold = v }))
-  tuningPanel.append(makeSliderRow('Adapt speed', bgSubAdaptRate, 0.001, 0.02, 0.001, v => { bgSubAdaptRate = v }))
 
   // Max objects slider
   const maxObjSection = document.createElement('div')
@@ -240,16 +395,67 @@ async function main() {
   function loop(ts: number) {
     const dt = Math.min(ts - prevTimestamp, 50)
     prevTimestamp = ts
-
-    // --- Tracking ---
-    const result = tracker.detect(video, ts)
-    if (result) {
-      lastPose = result.pose
-      lastHands = result.hands
+    // Convert normalised MediaPipe coords → canvas pixels, respecting all orientation flags.
+    // In portrait-cam mode the camera is rotated 90° CCW, so x/y axes are swapped and
+    // we apply the same -90° cover-fit transform that the renderer uses for the video.
+    const lm2canvas = (lmx: number, lmy: number): [number, number] => {
+      const W = canvas.width, H = canvas.height
+      if (portraitCam && !streamRotated) {
+        const vW = video.videoWidth || W
+        const vH = video.videoHeight || H
+        const s  = Math.max(W / vH, H / vW)
+        const sy = flipH ? -1 : 1   // in rotated local space, flipH acts on Y axis
+        const sx = flipV ? -1 : 1   // and flipV acts on X axis
+        return [
+          W / 2 + sy * (lmy - 0.5) * vH * s,
+          H / 2 - sx * (lmx - 0.5) * vW * s,
+        ]
+      }
+      return [
+        (flipH ? 1 - lmx : lmx) * W,
+        (flipV ? 1 - lmy : lmy) * H,
+      ]
     }
 
-    // --- RVM segmentation (async, runs every frame) ---
-    segmenter.segment(video).then(mask => { if (mask) lastSeg = mask })
+    // --- Update rotation canvas (portrait cam: draw video rotated 90° CW each frame) ---
+    if (streamRotated && rotCanvas && rotCtx && video.readyState >= 2 && video.videoWidth > 0) {
+      const vW = video.videoWidth, vH = video.videoHeight
+      // Ensure canvas dimensions match (in case video dimensions changed)
+      if (rotCanvas.width !== vH || rotCanvas.height !== vW) {
+        rotCanvas.width = vH
+        rotCanvas.height = vW
+      }
+      rotCtx.save()
+      rotCtx.translate(vH / 2, vW / 2)
+      rotCtx.rotate(Math.PI / 2)
+      rotCtx.drawImage(video, -vW / 2, -vH / 2, vW, vH)
+      rotCtx.restore()
+    }
+    const trackSource: HTMLVideoElement | HTMLCanvasElement = (streamRotated && rotCanvas) ? rotCanvas : video
+    frameCount++
+
+    // --- Tracking (every 2nd frame — MediaPipe is expensive; physics interpolates between) ---
+    if (frameCount % 2 === 0) {
+      const trackReady = streamRotated
+        ? (rotCanvas !== null && video.readyState >= 2 && video.videoWidth > 0)
+        : (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0)
+      const result = trackReady ? tracker.detect(trackSource, ts) : null
+      if (result) {
+        lastPose = result.pose
+        lastHands = result.hands
+      }
+    }
+
+    // --- RVM segmentation (worker-backed: non-blocking; guard prevents overlapping calls) ---
+    if (bgEnabled && !segmentPending) {
+      segmentPending = true
+      segmenter.segment(trackSource).then(mask => {
+        if (mask) lastSeg = mask
+        segmentPending = false
+      }).catch(() => { segmentPending = false })
+    }
+    // Clear stale mask when background replacement is turned off
+    if (!bgEnabled && lastSeg) lastSeg = null
 
     // --- Pose → physics bodies ---
     if (lastPose && lastPose.landmarks.length > 0) {
@@ -259,7 +465,7 @@ async function main() {
       // Wider shoulders = closer to camera = bigger head collider.
       const ls = lms[11], rs = lms[12]
       const shoulderPxDist = (ls && rs && (ls.visibility ?? 1) >= 0.3 && (rs.visibility ?? 1) >= 0.3)
-        ? Math.hypot((1 - ls.x) * canvas.width - (1 - rs.x) * canvas.width, ls.y * canvas.height - rs.y * canvas.height)
+        ? (() => { const [lx,ly] = lm2canvas(ls.x,ls.y); const [rx,ry] = lm2canvas(rs.x,rs.y); return Math.hypot(lx-rx,ly-ry) })()
         : 0
       // Head radius ≈ 28% of shoulder width; min = BODY_RADIUS
       const HEAD_RADIUS = shoulderPxDist > 0 ? Math.max(BODY_RADIUS, shoulderPxDist * 0.28) : BODY_RADIUS
@@ -274,22 +480,20 @@ async function main() {
           physics.parkLandmark(`p${idx}`)
           continue
         }
-        let cx = (1 - lm.x) * canvas.width
-        let cy = lm.y * canvas.height
+        let [lx, ly] = lm2canvas(lm.x, lm.y)
         const elbowIdx = WRIST_ELBOW[idx]
         if (elbowIdx !== undefined) {
           const elbow = lms[elbowIdx]
           if (elbow && (elbow.visibility ?? 1) >= 0.3) {
-            const ex = (1 - elbow.x) * canvas.width
-            const ey = elbow.y * canvas.height
-            cx = ex + (cx - ex) * 0.7
-            cy = ey + (cy - ey) * 0.7
+            const [ex, ey] = lm2canvas(elbow.x, elbow.y)
+            lx = ex + (lx - ex) * 0.7
+            ly = ey + (ly - ey) * 0.7
           }
         }
         const radius = idx === 0 ? HEAD_RADIUS : BODY_RADIUS
         // Shift head collider up from nose so it centers on the skull
-        const finalCy = idx === 0 ? cy - HEAD_RADIUS * 0.8 : cy
-        physics.updateLandmark(`p${idx}`, cx, finalCy, radius)
+        const finalLy = idx === 0 ? ly - HEAD_RADIUS * 0.8 : ly
+        physics.updateLandmark(`p${idx}`, lx, finalLy, radius)
       }
 
       // Bodies evenly spaced along each limb — 3 per segment fills the gaps between joints
@@ -301,8 +505,8 @@ async function main() {
           for (let s = 0; s < STEPS.length; s++) physics.parkLandmark(`mid_${a}_${b}_${s}`)
           continue
         }
-        const ax = (1 - lmA.x) * canvas.width,  ay = lmA.y * canvas.height
-        const bx = (1 - lmB.x) * canvas.width,  by = lmB.y * canvas.height
+        const [ax, ay] = lm2canvas(lmA.x, lmA.y)
+        const [bx, by] = lm2canvas(lmB.x, lmB.y)
         for (let s = 0; s < STEPS.length; s++) {
           const t = STEPS[s]
           physics.updateLandmark(`mid_${a}_${b}_${s}`, ax + (bx - ax) * t, ay + (by - ay) * t, BODY_RADIUS)
@@ -333,20 +537,19 @@ async function main() {
         const pinching = detectFist(lms)
         const wasPinching = pinchWas.get(i) ?? false
 
-        // Palm center in canvas coords (mirrored)
+        // Palm center in canvas coords
         const palm = getPalmCenter(lms)
-        const px = (1 - palm.x) * canvas.width
-        const py = palm.y * canvas.height
+        const [px, py] = lm2canvas(palm.x, palm.y)
 
         // Grab radius = wrist to palm center distance (palm length, not full finger reach)
         const wrist = lms[0]
-        const wristX = (1 - wrist.x) * canvas.width
-        const wristY = wrist.y * canvas.height
+        const [wristX, wristY] = lm2canvas(wrist.x, wrist.y)
         const handReach = Math.hypot(wristX - px, wristY - py)
 
-        // Hand rotation angle: direction from wrist to middle knuckle in mirrored space
+        // Hand rotation angle: wrist → middle knuckle direction in canvas space
         const midMcp = lms[9]
-        const handAngle = Math.atan2(midMcp.y - wrist.y, wrist.x - midMcp.x)
+        const [midMcpX, midMcpY] = lm2canvas(midMcp.x, midMcp.y)
+        const handAngle = Math.atan2(midMcpY - wristY, midMcpX - wristX)
 
         if (pinching && !wasPinching) {
           physics.tryGrab(i, px, py, handReach, handAngle)
@@ -369,11 +572,9 @@ async function main() {
         if (!physics.isGrabbing(i)) {
           const lms = lastHands.landmarks[i]
           const palm = getPalmCenter(lms)
-          const px = (1 - palm.x) * canvas.width
-          const py = palm.y * canvas.height
+          const [px, py] = lm2canvas(palm.x, palm.y)
           const wrist = lms[0]
-          const wristX = (1 - wrist.x) * canvas.width
-          const wristY = wrist.y * canvas.height
+          const [wristX, wristY] = lm2canvas(wrist.x, wrist.y)
           const handReach = Math.hypot(wristX - px, wristY - py)
           const hovered = physics.getHoverObject(i, px, py, handReach * 1.8)
           if (hovered) hoverObjects.add(hovered)
@@ -397,27 +598,48 @@ async function main() {
       if (s11 && s12 && h23 && h24 &&
           (s11.visibility ?? 1) >= 0.3 && (s12.visibility ?? 1) >= 0.3 &&
           (h23.visibility ?? 1) >= 0.3 && (h24.visibility ?? 1) >= 0.3) {
-        physics.pushFromTorso([
-          { x: (1 - s11.x) * canvas.width, y: s11.y * canvas.height },
-          { x: (1 - s12.x) * canvas.width, y: s12.y * canvas.height },
-          { x: (1 - h24.x) * canvas.width, y: h24.y * canvas.height },
-          { x: (1 - h23.x) * canvas.width, y: h23.y * canvas.height },
-        ])
+        physics.pushFromTorso([s11, s12, h24, h23].map(lm => { const [x,y] = lm2canvas(lm.x,lm.y); return {x,y} }))
       }
 
       // Neck/head triangle: nose + shoulders
       if (nose && s11 && s12 &&
           (nose.visibility ?? 1) >= 0.3 && (s11.visibility ?? 1) >= 0.3 && (s12.visibility ?? 1) >= 0.3) {
-        physics.pushFromTorso([
-          { x: (1 - nose.x) * canvas.width, y: nose.y * canvas.height },
-          { x: (1 - s11.x) * canvas.width,  y: s11.y * canvas.height },
-          { x: (1 - s12.x) * canvas.width,  y: s12.y * canvas.height },
-        ])
+        physics.pushFromTorso([nose, s11, s12].map(lm => { const [x,y] = lm2canvas(lm.x,lm.y); return {x,y} }))
       }
     }
 
+    // --- Screensaver: fade in after 3s of absent/small person, fade out when they return ---
+    if (screensaverEnabled) {
+      // "Present" = pose detected AND shoulders are wide enough (person close enough to screen)
+      // Shoulder pixel distance > 12% of canvas width means the person is meaningfully present
+      let personPresent = false
+      if ((lastPose?.landmarks.length ?? 0) > 0) {
+        const lms = lastPose!.landmarks[0]
+        const ls = lms[11], rs = lms[12]
+        if (ls && rs && (ls.visibility ?? 1) >= 0.4 && (rs.visibility ?? 1) >= 0.4) {
+          const [lx, ly] = lm2canvas(ls.x, ls.y)
+          const [rx, ry] = lm2canvas(rs.x, rs.y)
+          const shoulderPx = Math.hypot(lx - rx, ly - ry)
+          personPresent = shoulderPx > canvas.width * 0.12
+        }
+      }
+
+      if (personPresent) {
+        personAbsentMs = 0
+        screensaverAlpha = Math.max(0, screensaverAlpha - dt / 600)
+      } else {
+        personAbsentMs += dt
+        if (personAbsentMs > 3000) {
+          screensaverAlpha = Math.min(1, screensaverAlpha + dt / 1500)
+        }
+      }
+      screensaverOverlay.style.opacity = screensaverAlpha > 0.005 ? String(screensaverAlpha) : '0'
+    }
+
     // --- Render ---
-    renderFrame(ctx, video, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgEnabled, bgSubThreshold, bgSubAdaptRate, PRODUCT_INFO)
+    // When the stream is already rotated at source, renderer must not re-rotate
+    const rendererPortraitCam = portraitCam && !streamRotated
+    renderFrame(ctx, trackSource, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgImage, bgEnabled, screensaverAlpha, ts, PRODUCT_INFO, flipV, flipH, rendererPortraitCam)
 
     requestAnimationFrame(loop)
   }

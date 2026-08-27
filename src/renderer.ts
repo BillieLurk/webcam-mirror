@@ -4,222 +4,95 @@ import type { ImageInfo, ProductInfo } from './assets'
 import type { AlphaMask } from './segmenter'
 import { detectFist, getPalmCenter } from './tracker'
 
-// Offscreen canvases for background replacement compositing, lazily created
-let offVideo: OffscreenCanvas | null = null
-let offVideoCtx: OffscreenCanvasRenderingContext2D | null = null
-
-// Background subtraction model: RGB float per pixel (0-255 range)
-let bgModel: Float32Array | null = null
-// Temporal smoothing buffer: per-pixel bg alpha from previous frame
-let prevBgAlpha: Float32Array | null = null
-
-function ensureOffscreen(w: number, h: number) {
-  if (!offVideo || offVideo.width !== w || offVideo.height !== h) {
-    offVideo = new OffscreenCanvas(w, h)
-    offVideoCtx = offVideo.getContext('2d')!
-  }
-}
-
-/** Draw the mirrored video frame into the offscreen canvas and return its ImageData. */
-function captureVideoFrame(video: HTMLVideoElement, W: number, H: number): ImageData {
-  ensureOffscreen(W, H)
-  const oc = offVideoCtx!
-  oc.save()
-  oc.translate(W, 0)
-  oc.scale(-1, 1)
-  oc.drawImage(video, 0, 0, W, H)
-  oc.restore()
-  return oc.getImageData(0, 0, W, H)
-}
+// Offscreen canvases for background compositing, lazily created
+let maskCanvas: OffscreenCanvas | null = null
+let maskCtx: OffscreenCanvasRenderingContext2D | null = null
+let personCanvas: OffscreenCanvas | null = null
+let personCtx: OffscreenCanvasRenderingContext2D | null = null
 
 /**
- * Snapshot the current video frame as the background model.
- * Call this when no one is standing in frame.
+ * Composite the person (from RVM alpha) over a solid background colour.
+ * Uses OffscreenCanvas compositing (GPU) instead of per-pixel JS loops.
  */
-export function captureBgFrame(video: HTMLVideoElement, W: number, H: number) {
-  const { data } = captureVideoFrame(video, W, H)
-  const numPx = W * H
-  bgModel = new Float32Array(numPx * 3)
-  for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
-    bgModel[j]     = data[i]
-    bgModel[j + 1] = data[i + 1]
-    bgModel[j + 2] = data[i + 2]
+function drawBackground(ctx: CanvasRenderingContext2D, bgColor: string, bgImage: HTMLImageElement | null, W: number, H: number) {
+  if (bgImage && bgImage.complete && bgImage.naturalWidth > 0) {
+    const iW = bgImage.naturalWidth
+    const iH = bgImage.naturalHeight
+    // Cover-fit: scale to fill the canvas without distortion
+    const scale = Math.max(W / iW, H / iH)
+    const dw = iW * scale
+    const dh = iH * scale
+    ctx.drawImage(bgImage, (W - dw) / 2, (H - dh) / 2, dw, dh)
+  } else {
+    ctx.fillStyle = bgColor
+    ctx.fillRect(0, 0, W, H)
   }
-  prevBgAlpha = null  // reset temporal buffer after hard capture
 }
 
-export function hasBgModel(): boolean { return bgModel !== null }
-
-/**
- * Combined background subtraction + MediaPipe segmentation.
- *
- * BG subtraction gives pixel-sharp edges; MediaPipe provides semantic
- * understanding of where the person is. A pixel is only replaced with
- * the background colour when BOTH methods agree it is background:
- *
- *   finalBgAlpha = bgSubAlpha × (1 − mediapipePersonConf)
- *
- * This prevents lighting changes or camera noise from creating holes in
- * the person while still producing cleaner edges than MediaPipe alone.
- *
- * The background model adapts slowly so a nudged camera re-learns over
- * time, but only updates pixels confirmed as background by both methods.
- */
-function drawWithBgSub(
-  ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  segmentation: AlphaMask | null,
-  bgColor: string,
-  W: number,
-  H: number,
-  threshold: number,
-  adaptRate: number,
-) {
-  const imageData = captureVideoFrame(video, W, H)
-  const pixels = imageData.data
-  const [bgR, bgG, bgB] = parseCssColor(bgColor)
-  const numPx = W * H
-
-  // RVM alpha mask — bilinear sampled per pixel
-  const maskArr = segmentation?.data ?? null
-  const maskW = segmentation?.width ?? 0
-  const maskH = segmentation?.height ?? 0
-
-  // Auto-initialise model from the first frame if not yet captured
-  if (!bgModel || bgModel.length !== numPx * 3) {
-    bgModel = new Float32Array(numPx * 3)
-    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 3) {
-      bgModel[j] = pixels[i]; bgModel[j + 1] = pixels[i + 1]; bgModel[j + 2] = pixels[i + 2]
-    }
-    ctx.putImageData(imageData, 0, 0)
-    return
-  }
-
-  if (!prevBgAlpha || prevBgAlpha.length !== numPx) {
-    prevBgAlpha = new Float32Array(numPx)
-  }
-
-  // MediaPipe: person confidence above this → veto removal regardless of BG sub
-  const PERSON_VETO = 0.75
-  const EDGE        = threshold * 0.4
-  const TEMPORAL    = 0.5
-
-  for (let cy = 0; cy < H; cy++) {
-    const fy = maskArr ? (cy / H) * maskH : 0
-    for (let cx = 0; cx < W; cx++) {
-      const pi = cy * W + cx
-      const i  = pi * 4
-      const j  = pi * 3
-
-      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2]
-      const mr = bgModel[j], mg = bgModel[j + 1], mb = bgModel[j + 2]
-
-      // BG subtraction at full video resolution → sharp pixel-level decision
-      const dr = r - mr, dg = g - mg, db = b - mb
-      const dist = Math.sqrt(dr * dr + dg * dg + db * db)
-      let bgSubAlpha: number
-      if (dist < threshold - EDGE)      bgSubAlpha = 1
-      else if (dist > threshold + EDGE) bgSubAlpha = 0
-      else {
-        const t = (dist - (threshold - EDGE)) / (2 * EDGE)
-        bgSubAlpha = 1 - t * t * (3 - 2 * t)
-      }
-
-      // MediaPipe veto: if it's very confident this is a person, never remove it.
-      // Otherwise BG sub makes the full-resolution call.
-      let raw = bgSubAlpha
-      if (maskArr) {
-        const vx = W - 1 - cx  // un-mirror x for mask coords
-        const fx = (vx / W) * maskW
-        const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, maskW - 1)
-        const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, maskH - 1)
-        const tx = fx - x0, ty = fy - y0
-        const personConf =
-          (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
-          ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
-        if (personConf > PERSON_VETO) raw = 0  // hard veto: always keep the person
-      }
-
-      // Temporal smoothing to suppress frame-to-frame flicker
-      const alpha = prevBgAlpha[pi] * TEMPORAL + raw * (1 - TEMPORAL)
-      prevBgAlpha[pi] = alpha
-
-      // Update model only where BG sub and MediaPipe both agree it's background
-      if (raw > 0.75) {
-        bgModel[j]     += (r - bgModel[j])     * adaptRate
-        bgModel[j + 1] += (g - bgModel[j + 1]) * adaptRate
-        bgModel[j + 2] += (b - bgModel[j + 2]) * adaptRate
-      }
-
-      if (alpha > 0.005) {
-        pixels[i]     = ((r * (1 - alpha)) + bgR * alpha) | 0
-        pixels[i + 1] = ((g * (1 - alpha)) + bgG * alpha) | 0
-        pixels[i + 2] = ((b * (1 - alpha)) + bgB * alpha) | 0
-      }
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0)
-}
-
-/**
- * ML segmentation fallback — used when no bg model has been captured.
- */
 function drawWithSegmentation(
   ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  segmentation: AlphaMask,
+  video: HTMLVideoElement | HTMLCanvasElement,
+  seg: AlphaMask,
   bgColor: string,
+  bgImage: HTMLImageElement | null,
   W: number,
   H: number,
+  flipV: boolean,
+  flipH: boolean,
+  portraitCam: boolean,
 ) {
-  const imageData = captureVideoFrame(video, W, H)
-  const pixels = imageData.data
+  const { data: alphaData, width: mW, height: mH } = seg
 
-  const maskArr = segmentation.data
-  const maskW = segmentation.width
-  const maskH = segmentation.height
-  const [bgR, bgG, bgB] = parseCssColor(bgColor)
-
-  for (let cy = 0; cy < H; cy++) {
-    const fy = (cy / H) * maskH
-    for (let cx = 0; cx < W; cx++) {
-      // Bilinear sample into mask (un-mirrored x since video is already mirrored)
-      const videoX = W - 1 - cx
-      const fx = (videoX / W) * maskW
-      const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, maskW - 1)
-      const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, maskH - 1)
-      const tx = fx - x0, ty = fy - y0
-      const personConf =
-        (1 - ty) * ((1 - tx) * maskArr[y0 * maskW + x0] + tx * maskArr[y0 * maskW + x1]) +
-        ty       * ((1 - tx) * maskArr[y1 * maskW + x0] + tx * maskArr[y1 * maskW + x1])
-
-      // Steepen the confidence curve — map [0.3, 0.7] → [0, 1] smoothstep
-      // so uncertain pixels snap to one side rather than feathering across many pixels
-      const t = Math.max(0, Math.min(1, (personConf - 0.3) / 0.4))
-      const sharpConf = t * t * (3 - 2 * t)
-      const bgAlpha = 1 - sharpConf
-
-      if (bgAlpha > 0.005) {
-        const pi = (cy * W + cx) * 4
-        pixels[pi]     = (pixels[pi]     * sharpConf + bgR * bgAlpha) | 0
-        pixels[pi + 1] = (pixels[pi + 1] * sharpConf + bgG * bgAlpha) | 0
-        pixels[pi + 2] = (pixels[pi + 2] * sharpConf + bgB * bgAlpha) | 0
-      }
-    }
+  // Build alpha mask ImageData at RVM resolution
+  if (!maskCanvas || maskCanvas.width !== mW || maskCanvas.height !== mH) {
+    maskCanvas = new OffscreenCanvas(mW, mH)
+    maskCtx = maskCanvas.getContext('2d')!
   }
+  const maskImg = maskCtx!.createImageData(mW, mH)
+  const mp = maskImg.data
+  for (let i = 0; i < mW * mH; i++) {
+    mp[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, alphaData[i])) * 255)
+  }
+  maskCtx!.putImageData(maskImg, 0, 0)
 
-  ctx.putImageData(imageData, 0, 0)
-}
+  // Draw mirrored video onto personCanvas, then cut out background via mask
+  if (!personCanvas || personCanvas.width !== W || personCanvas.height !== H) {
+    personCanvas = new OffscreenCanvas(W, H)
+    personCtx = personCanvas.getContext('2d')!
+  }
+  personCtx!.clearRect(0, 0, W, H)
+  personCtx!.save()
+  if (portraitCam) {
+    // Portrait: rotate video -90° (cover-fit) so portrait content fills landscape canvas.
+    // Both video and mask get the same transform → they stay aligned.
+    const vW = video instanceof HTMLVideoElement ? video.videoWidth : video.width
+    const vH = video instanceof HTMLVideoElement ? video.videoHeight : video.height
+    const s = Math.max(W / vH, H / vW)
+    const dw = vW * s, dh = vH * s
+    personCtx!.translate(W / 2, H / 2)
+    personCtx!.rotate(-Math.PI / 2)
+    // In rotated local space: X→visual-down, Y→visual-right, so swap flip axes
+    personCtx!.scale(flipV ? -1 : 1, flipH ? -1 : 1)
+    personCtx!.drawImage(video, -dw / 2, -dh / 2, dw, dh)
+    personCtx!.globalCompositeOperation = 'destination-in'
+    personCtx!.filter = 'blur(2px)'
+    personCtx!.drawImage(maskCanvas, -dw / 2, -dh / 2, dw, dh)
+    personCtx!.filter = 'none'
+  } else {
+    personCtx!.translate(flipH ? W : 0, flipV ? H : 0)
+    personCtx!.scale(flipH ? -1 : 1, flipV ? -1 : 1)
+    personCtx!.drawImage(video, 0, 0, W, H)
+    personCtx!.globalCompositeOperation = 'destination-in'
+    personCtx!.filter = 'blur(2px)'
+    personCtx!.drawImage(maskCanvas, 0, 0, W, H)
+    personCtx!.filter = 'none'
+  }
+  personCtx!.restore()
+  personCtx!.globalCompositeOperation = 'source-over'
 
-/** Parse a CSS hex color like "#rrggbb" into [r, g, b]. */
-function parseCssColor(hex: string): [number, number, number] {
-  const c = hex.replace('#', '')
-  return [
-    parseInt(c.slice(0, 2), 16),
-    parseInt(c.slice(2, 4), 16),
-    parseInt(c.slice(4, 6), 16),
-  ]
+  // Background + masked person on top
+  drawBackground(ctx, bgColor, bgImage, W, H)
+  ctx.drawImage(personCanvas, 0, 0)
 }
 
 // All pose skeleton connections
@@ -264,14 +137,62 @@ const HAND_CONNECTIONS: [number, number][] = [
   [13, 17], [0, 17], [17, 18], [18, 19], [19, 20], // pinky + palm
 ]
 
-/** Convert normalized MediaPipe landmark to mirrored canvas coordinates. */
-function lm2c(lm: NormalizedLandmark, W: number, H: number): [number, number] {
-  return [(1 - lm.x) * W, lm.y * H]
+/** Convert normalized MediaPipe landmark to canvas coordinates, respecting flip state. */
+function lm2c(lm: NormalizedLandmark, W: number, H: number, flipV = false, flipH = true): [number, number] {
+  return [(flipH ? 1 - lm.x : lm.x) * W, (flipV ? 1 - lm.y : lm.y) * H]
+}
+
+// Fixed screensaver orb positions & properties (stable across frames)
+const ORBS = [
+  { nx: 0.22, ny: 0.38, nr: 0.28, color: [76, 201, 240],  sx: 0.7, sy: 0.5,  phase: 0.0 },
+  { nx: 0.78, ny: 0.62, nr: 0.24, color: [6, 255, 165],   sx: 0.5, sy: 0.7,  phase: 2.1 },
+  { nx: 0.50, ny: 0.25, nr: 0.20, color: [123, 94, 167],  sx: 0.6, sy: 0.45, phase: 4.2 },
+  { nx: 0.15, ny: 0.72, nr: 0.18, color: [255, 100, 130], sx: 0.4, sy: 0.6,  phase: 1.0 },
+  { nx: 0.85, ny: 0.28, nr: 0.16, color: [255, 200, 50],  sx: 0.55, sy: 0.5, phase: 3.3 },
+]
+
+function drawScreensaver(ctx: CanvasRenderingContext2D, alpha: number, t: number, W: number, H: number) {
+  if (alpha <= 0.005) return
+  const ms = t  // requestAnimationFrame timestamp in ms
+
+  ctx.save()
+  ctx.globalAlpha = alpha
+
+  // Dark vignette base
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'
+  ctx.fillRect(0, 0, W, H)
+
+  // Softly drifting glow orbs
+  ctx.globalCompositeOperation = 'lighter'
+  for (const o of ORBS) {
+    const x = (o.nx + Math.sin(ms * 0.0003 * o.sx + o.phase) * 0.09) * W
+    const y = (o.ny + Math.cos(ms * 0.0002 * o.sy + o.phase) * 0.07) * H
+    const r = o.nr * Math.min(W, H)
+    const [r0, g0, b0] = o.color
+    const grad = ctx.createRadialGradient(x, y, 0, x, y, r)
+    grad.addColorStop(0, `rgba(${r0},${g0},${b0},0.18)`)
+    grad.addColorStop(1, `rgba(${r0},${g0},${b0},0)`)
+    ctx.fillStyle = grad
+    ctx.fillRect(x - r, y - r, r * 2, r * 2)
+  }
+  ctx.globalCompositeOperation = 'source-over'
+
+  // Pulsing hint text
+  const textPulse = 0.55 + Math.sin(ms * 0.0015) * 0.25
+  ctx.globalAlpha = alpha * textPulse
+  ctx.fillStyle = 'rgba(255,255,255,0.9)'
+  ctx.font = '500 16px system-ui,-apple-system,sans-serif'
+  ctx.textAlign = 'center'
+  ctx.letterSpacing = '0.12em'
+  ctx.fillText('STEP IN FRONT OF THE CAMERA', W / 2, H / 2)
+  ctx.letterSpacing = '0'
+
+  ctx.restore()
 }
 
 export function renderFrame(
   ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
+  video: HTMLVideoElement | HTMLCanvasElement,
   objects: FloatingObject[],
   poseResult: PoseLandmarkerResult | null,
   handResult: HandLandmarkerResult | null,
@@ -281,27 +202,37 @@ export function renderFrame(
   images: Map<string, ImageInfo>,
   segmentation: AlphaMask | null,
   bgColor: string,
+  bgImage: HTMLImageElement | null,
   bgEnabled: boolean,
-  bgSubThreshold: number,
-  bgSubAdaptRate: number,
+  screensaverAlpha: number,
+  timestamp: number,
   productInfo: Record<string, ProductInfo>,
+  flipV: boolean,
+  flipH: boolean,
+  portraitCam: boolean,
 ) {
   const { width: W, height: H } = ctx.canvas
 
   ctx.clearRect(0, 0, W, H)
 
-  if (bgEnabled && bgModel) {
-    // Combined path: BG subtraction + RVM veto (sharpest edges)
-    drawWithBgSub(ctx, video, segmentation, bgColor, W, H, bgSubThreshold, bgSubAdaptRate)
-  } else if (bgEnabled && segmentation) {
-    // RVM-only fallback: no bg model captured yet
-    drawWithSegmentation(ctx, video, segmentation, bgColor, W, H)
+  if (bgEnabled && segmentation) {
+    drawWithSegmentation(ctx, video, segmentation, bgColor, bgImage, W, H, flipV, flipH, portraitCam)
   } else {
-    // Plain mirrored webcam
     ctx.save()
-    ctx.translate(W, 0)
-    ctx.scale(-1, 1)
-    ctx.drawImage(video, 0, 0, W, H)
+    if (portraitCam) {
+      const vW = video instanceof HTMLVideoElement ? video.videoWidth : video.width
+      const vH = video instanceof HTMLVideoElement ? video.videoHeight : video.height
+      const s = Math.max(W / vH, H / vW)
+      const dw = vW * s, dh = vH * s
+      ctx.translate(W / 2, H / 2)
+      ctx.rotate(-Math.PI / 2)
+      ctx.scale(flipV ? -1 : 1, flipH ? -1 : 1)
+      ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh)
+    } else {
+      ctx.translate(flipH ? W : 0, flipV ? H : 0)
+      ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1)
+      ctx.drawImage(video, 0, 0, W, H)
+    }
     ctx.restore()
   }
 
@@ -320,7 +251,7 @@ export function renderFrame(
 
   // Debug: pose skeleton
   if (debugMode && poseResult && poseResult.landmarks.length > 0) {
-    drawPoseSkeleton(ctx, poseResult.landmarks[0], W, H)
+    drawPoseSkeleton(ctx, poseResult.landmarks[0], W, H, flipV, flipH)
   }
 
   // Hand overlays (always show grab/pinch feedback)
@@ -329,9 +260,12 @@ export function renderFrame(
       const lms = handResult.landmarks[i]
       const pinching = detectFist(lms)
       const isGrabbing = grabbing.get(i) ?? false
-      drawHandOverlay(ctx, lms, W, H, pinching, isGrabbing, debugMode)
+      drawHandOverlay(ctx, lms, W, H, pinching, isGrabbing, debugMode, flipV, flipH)
     }
   }
+
+  // Screensaver overlay — on top of everything
+  drawScreensaver(ctx, screensaverAlpha, timestamp, W, H)
 }
 
 function drawObject(
@@ -439,7 +373,6 @@ function drawDescriptionCard(ctx: CanvasRenderingContext2D, obj: FloatingObject,
   ctx.save()
   ctx.globalAlpha = obj.alpha * ease
   ctx.translate(obj.body.position.x + GAP, obj.body.position.y)
-  ctx.rotate(-Math.PI / 2)
   ctx.translate((1 - ease) * 28, 0)
 
   // Card background
@@ -495,7 +428,11 @@ function drawPoseSkeleton(
   landmarks: NormalizedLandmark[],
   W: number,
   H: number,
+  flipV = false,
+  flipH = true,
 ) {
+  const c = (lm: NormalizedLandmark) => lm2c(lm, W, H, flipV, flipH)
+
   ctx.save()
   ctx.lineCap = 'round'
 
@@ -508,8 +445,8 @@ function drawPoseSkeleton(
     const lmA = landmarks[a]
     const lmB = landmarks[b]
     if (!lmA || !lmB || (lmA.visibility ?? 1) < 0.25 || (lmB.visibility ?? 1) < 0.25) continue
-    const [ax, ay] = lm2c(lmA, W, H)
-    const [bx, by] = lm2c(lmB, W, H)
+    const [ax, ay] = c(lmA)
+    const [bx, by] = c(lmB)
     ctx.beginPath()
     ctx.moveTo(ax, ay)
     ctx.lineTo(bx, by)
@@ -526,8 +463,8 @@ function drawPoseSkeleton(
     const lmA = landmarks[a]
     const lmB = landmarks[b]
     if (!lmA || !lmB || (lmA.visibility ?? 1) < 0.25 || (lmB.visibility ?? 1) < 0.25) continue
-    const [ax, ay] = lm2c(lmA, W, H)
-    const [bx, by] = lm2c(lmB, W, H)
+    const [ax, ay] = c(lmA)
+    const [bx, by] = c(lmB)
     ctx.beginPath()
     ctx.moveTo(ax, ay)
     ctx.lineTo(bx, by)
@@ -538,7 +475,7 @@ function drawPoseSkeleton(
   for (let i = 0; i < landmarks.length; i++) {
     const lm = landmarks[i]
     if ((lm.visibility ?? 1) < 0.25) continue
-    const [x, y] = lm2c(lm, W, H)
+    const [x, y] = c(lm)
     const pushing = PUSHING_JOINTS.has(i)
     ctx.beginPath()
     ctx.arc(x, y, pushing ? 6 : 3, 0, Math.PI * 2)
@@ -556,8 +493,8 @@ function drawPoseSkeleton(
   for (const [a, b] of LIMB_PAIRS) {
     const lmA = landmarks[a], lmB = landmarks[b]
     if (!lmA || !lmB || (lmA.visibility ?? 1) < 0.25 || (lmB.visibility ?? 1) < 0.25) continue
-    const [ax, ay] = lm2c(lmA, W, H)
-    const [bx, by] = lm2c(lmB, W, H)
+    const [ax, ay] = c(lmA)
+    const [bx, by] = c(lmB)
     for (const t of LIMB_STEPS) {
       ctx.beginPath()
       ctx.arc(ax + (bx - ax) * t, ay + (by - ay) * t, COLLIDER_RADIUS, 0, Math.PI * 2)
@@ -569,9 +506,9 @@ function drawPoseSkeleton(
   const head = landmarks[0], lShoulder = landmarks[11], rShoulder = landmarks[12]
   if (head && (head.visibility ?? 1) >= 0.25 && lShoulder && rShoulder &&
       (lShoulder.visibility ?? 1) >= 0.25 && (rShoulder.visibility ?? 1) >= 0.25) {
-    const [hx, hy] = lm2c(head, W, H)
-    const [lsx, lsy] = lm2c(lShoulder, W, H)
-    const [rsx, rsy] = lm2c(rShoulder, W, H)
+    const [hx, hy] = c(head)
+    const [lsx, lsy] = c(lShoulder)
+    const [rsx, rsy] = c(rShoulder)
     const shoulderDist = Math.hypot(lsx - rsx, lsy - rsy)
     const headR = shoulderDist * 0.28
     ctx.beginPath()
@@ -595,7 +532,13 @@ function drawHandOverlay(
   isFist: boolean,
   isGrabbing: boolean,
   debugMode: boolean,
+  flipV = false,
+  flipH = true,
 ) {
+  const c = (lm: NormalizedLandmark) => lm2c(lm, W, H, flipV, flipH)
+  const toX = (x: number) => (flipH ? 1 - x : x) * W
+  const toY = (y: number) => (flipV ? 1 - y : y) * H
+
   if (debugMode) {
     const lineColor = isFist ? '#ffd60a' : 'rgba(255,255,255,0.7)'
     ctx.save()
@@ -607,8 +550,8 @@ function drawHandOverlay(
 
     for (const [a, b] of HAND_CONNECTIONS) {
       if (!landmarks[a] || !landmarks[b]) continue
-      const [ax, ay] = lm2c(landmarks[a], W, H)
-      const [bx, by] = lm2c(landmarks[b], W, H)
+      const [ax, ay] = c(landmarks[a])
+      const [bx, by] = c(landmarks[b])
       ctx.beginPath()
       ctx.moveTo(ax, ay)
       ctx.lineTo(bx, by)
@@ -618,7 +561,7 @@ function drawHandOverlay(
     ctx.shadowBlur = 0
     for (const i of [4, 8, 12, 16, 20]) {
       if (!landmarks[i]) continue
-      const [x, y] = lm2c(landmarks[i], W, H)
+      const [x, y] = c(landmarks[i])
       ctx.beginPath()
       ctx.arc(x, y, 5, 0, Math.PI * 2)
       ctx.fillStyle = isFist ? '#ffd60a' : '#ff6b6b'
@@ -629,13 +572,13 @@ function drawHandOverlay(
 
   // Grab indicator centered on palm
   const palm = getPalmCenter(landmarks)
-  const px = (1 - palm.x) * W
-  const py = palm.y * H
+  const px = toX(palm.x)
+  const py = toY(palm.y)
 
   // Reach radius: wrist → palm center (same calc as main.ts)
   const wrist = landmarks[0]
-  const wx = (1 - wrist.x) * W
-  const wy = wrist.y * H
+  const wx = toX(wrist.x)
+  const wy = toY(wrist.y)
   const reach = Math.hypot(wx - px, wy - py)
 
   if (isFist || isGrabbing) {

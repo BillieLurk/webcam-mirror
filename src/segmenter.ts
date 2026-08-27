@@ -1,18 +1,12 @@
 /**
- * RobustVideoMatting (RVM) segmenter.
+ * RobustVideoMatting (RVM) segmenter — worker-backed.
  *
- * Runs Peter Lin's RVM mobilenetv3 ONNX model via ONNX Runtime Web.
- * Produces a full-resolution alpha matte per frame with temporal consistency
- * via recurrent hidden states — far better edge quality than MediaPipe selfie_segmenter.
+ * Runs inference in a Web Worker so the main animation loop is never blocked.
+ * The worker tries WebGPU → WebGL → WASM in order of preference.
  *
- * Model: public/models/rvm_mobilenetv3.onnx (~14 MB)
+ * Model: public/models/rvm_mobilenetv3.onnx (~7 MB fp16)
  * GitHub: https://github.com/PeterL1n/RobustVideoMatting
  */
-
-import * as ort from 'onnxruntime-web'
-
-// Point ONNX Runtime at its WASM files (Vite serves node_modules as-is via ?url)
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/'
 
 export interface AlphaMask {
   data: Float32Array   // per-pixel alpha, 0=background, 1=person, length = width*height
@@ -20,81 +14,97 @@ export interface AlphaMask {
   height: number
 }
 
-// Offscreen canvas for video → tensor conversion (reused each frame)
+// Small canvas for extracting pixel data from video/canvas each frame (main thread)
 let srcCanvas: OffscreenCanvas | null = null
 let srcCtx: OffscreenCanvasRenderingContext2D | null = null
 
 export class RVMSegmenter {
-  private session: ort.InferenceSession | null = null
-  private r1: ort.Tensor | null = null
-  private r2: ort.Tensor | null = null
-  private r3: ort.Tensor | null = null
-  private r4: ort.Tensor | null = null
+  private worker: Worker | null = null
+  private pendingResolve: ((mask: AlphaMask | null) => void) | null = null
+  private _ready = false
+  private _backend = 'unknown'
 
-  // Downsample ratio: 0.25 = fast (320×180 internal at 720p), 0.5 = higher quality
-  downsampleRatio = 0.25
+  /** Resolution divisor: source is fed at 1/N size. Lower = faster, higher = better edges. */
+  downsampleFactor = 2
 
   async init(onProgress?: (msg: string) => void): Promise<void> {
     onProgress?.('Loading RVM segmentation model...')
-    this.session = await ort.InferenceSession.create('/models/rvm_mobilenetv3.onnx', {
-      executionProviders: ['webgl', 'wasm'],
-      graphOptimizationLevel: 'all',
+
+    this.worker = new Worker(
+      new URL('./segmenter.worker.ts', import.meta.url),
+      { type: 'module' },
+    )
+
+    // Persistent message handler for both init and ongoing segment responses
+    this.worker.onmessage = (e: MessageEvent) => {
+      const { type } = e.data
+      if (type === 'ready') {
+        this._ready = true
+        const backend: string = e.data.backend ?? 'wasm'
+        this._backend = backend
+        onProgress?.(`Segmentation ready (${backend})`)
+        this._initResolve?.()
+        this._initResolve = null
+      } else if (type === 'error') {
+        this._initReject?.(new Error(e.data.message))
+        this._initResolve = null
+        this._initReject = null
+      } else if (type === 'mask') {
+        this.pendingResolve?.({ data: e.data.data, width: e.data.width, height: e.data.height })
+        this.pendingResolve = null
+      } else if (type === 'skip') {
+        this.pendingResolve?.(null)
+        this.pendingResolve = null
+      } else if (type === 'backend') {
+        this._backend = e.data.backend
+        console.log(`[segmenter] switched to backend: ${e.data.backend}`)
+      }
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      this._initResolve = resolve
+      this._initReject = reject
+      this.worker!.postMessage({ type: 'init' })
     })
-    this.resetState()
   }
+
+  private _initResolve: (() => void) | null = null
+  private _initReject: ((e: Error) => void) | null = null
 
   /** Reset recurrent state — call when video source changes or after a long pause. */
   resetState() {
-    const zero = () => new ort.Tensor('float32', new Float32Array([0]), [1, 1, 1, 1])
-    this.r1 = zero(); this.r2 = zero(); this.r3 = zero(); this.r4 = zero()
+    this.worker?.postMessage({ type: 'reset' })
   }
 
-  async segment(video: HTMLVideoElement): Promise<AlphaMask | null> {
-    if (!this.session || !this.r1 || !this.r2 || !this.r3 || !this.r4) return null
+  async segment(source: HTMLVideoElement | HTMLCanvasElement): Promise<AlphaMask | null> {
+    if (!this.worker || !this._ready) return null
+    // Drop frame if previous result hasn't been picked up yet
+    if (this.pendingResolve) { return null }
 
-    const W = video.videoWidth
-    const H = video.videoHeight
+    const W = source instanceof HTMLVideoElement ? source.videoWidth  : source.width
+    const H = source instanceof HTMLVideoElement ? source.videoHeight : source.height
     if (!W || !H) return null
 
-    // Draw video into offscreen canvas to extract pixel data
-    if (!srcCanvas || srcCanvas.width !== W || srcCanvas.height !== H) {
-      srcCanvas = new OffscreenCanvas(W, H)
-      srcCtx = srcCanvas.getContext('2d')!
+    const IW = Math.max(1, Math.round(W / this.downsampleFactor))
+    const IH = Math.max(1, Math.round(H / this.downsampleFactor))
+
+    // Draw source into offscreen canvas to extract pixel data
+    if (!srcCanvas || srcCanvas.width !== IW || srcCanvas.height !== IH) {
+      srcCanvas = new OffscreenCanvas(IW, IH)
+      srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true })!
     }
-    srcCtx!.drawImage(video, 0, 0, W, H)
-    const { data } = srcCtx!.getImageData(0, 0, W, H)
+    srcCtx!.drawImage(source, 0, 0, IW, IH)
+    const imageData = srcCtx!.getImageData(0, 0, IW, IH)
 
-    // Convert RGBA uint8 → RGB float32 planar [1, 3, H, W], normalized 0–1
-    const numPx = W * H
-    const rgb = new Float32Array(3 * numPx)
-    for (let i = 0; i < numPx; i++) {
-      rgb[i]             = data[i * 4]     / 255  // R plane
-      rgb[i + numPx]     = data[i * 4 + 1] / 255  // G plane
-      rgb[i + 2 * numPx] = data[i * 4 + 2] / 255  // B plane
-    }
-    const src = new ort.Tensor('float32', rgb, [1, 3, H, W])
+    // Transfer pixel buffer to worker (zero-copy — no serialization overhead)
+    const rgba = imageData.data.buffer
 
-    const feeds = {
-      src,
-      r1i: this.r1,
-      r2i: this.r2,
-      r3i: this.r3,
-      r4i: this.r4,
-      downsample_ratio: new ort.Tensor('float32', [this.downsampleRatio]),
-    }
-
-    const results = await this.session.run(feeds)
-
-    // Update recurrent states for next frame (temporal consistency)
-    this.r1 = results['r1o'] as ort.Tensor
-    this.r2 = results['r2o'] as ort.Tensor
-    this.r3 = results['r3o'] as ort.Tensor
-    this.r4 = results['r4o'] as ort.Tensor
-
-    // Alpha matte: [1, 1, H, W] float32, 0=background, 1=person
-    const pha = results['pha'] as ort.Tensor
-    return { data: pha.data as Float32Array, width: W, height: H }
+    return new Promise((resolve) => {
+      this.pendingResolve = resolve
+      this.worker!.postMessage({ type: 'segment', rgba, width: IW, height: IH }, [rgba])
+    })
   }
 
-  get ready(): boolean { return this.session !== null }
+  get ready(): boolean { return this._ready }
+  get backend(): string { return this._backend }
 }

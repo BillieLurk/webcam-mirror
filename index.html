@@ -33,7 +33,7 @@
 
       #ui {
         position: fixed;
-        top: 56px;
+        top: 112px;
         right: 16px;
         display: flex;
         flex-direction: column;
@@ -231,24 +231,20 @@
         background-color: white;
         left: 0;
         top: 0;
-        width: 88px;
-        height: 100vh;
+        width: 100vw;
+        height: 64px;
         display: flex;
         align-items: center;
         justify-content: center;
         pointer-events: none;
-        z-index: 5;
-        overflow: visible;
+        z-index: 31;
       "
     >
       <img
         src="/assets/Black logo.png"
         style="
-          width: 560px;
-          height: 64px;
+          height: 44px;
           object-fit: contain;
-          transform: rotate(-90deg);
-          flex-shrink: 0;
         "
       />
     </div>
@@ -256,13 +252,28 @@
     <button
       id="menuBtn"
       class="btn"
-      style="position: fixed; top: 16px; right: 16px; z-index: 11"
+      style="position: fixed; top: 72px; right: 16px; z-index: 11"
     >
       ⚙
+    </button>
+    <button
+      id="fullscreenBtn"
+      class="btn"
+      style="position: fixed; top: 72px; right: 60px; z-index: 11"
+    >
+      ⛶
     </button>
 
     <div id="ui" style="display: none">
       <button class="btn" id="debugBtn">Debug Skeleton</button>
+      <div class="btn-row">
+        <button class="btn" id="portraitCamBtn" style="flex:1">Portrait Cam</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="flipHBtn" style="flex:1">Flip Horizontal</button>
+        <button class="btn" id="flipVBtn" style="flex:1">Flip Vertical</button>
+      </div>
+      <button class="btn" id="screensaverBtn">Screensaver</button>
       <button class="btn" id="addBtn">+ Add Objects</button>
       <button class="btn" id="clearBtn">Clear Objects</button>
       <div class="btn-row">
@@ -276,9 +287,11 @@
           title="Background color"
         />
       </div>
-      <button class="btn" id="captureBgBtn" style="border-top: 1px solid rgba(255,255,255,0.1); padding-top: 16px; margin-top: 4px;">
-        Capture Background
-      </button>
+      <div class="btn-row">
+        <button class="btn" id="bgImageBtn" style="flex: 1">Upload BG Image</button>
+        <button class="btn" id="clearBgImageBtn" style="display:none; padding: 9px 12px">✕</button>
+      </div>
+      <input type="file" id="bgImageInput" accept="image/*" style="display:none" />
       <div
         style="border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 8px"
       >
@@ -292,6 +305,14 @@
     <div id="status">Initializing...</div>
     <div id="hint">
       Pinch to grab objects &nbsp;|&nbsp; Move your body to push them
+    </div>
+
+    <!-- Screensaver image overlay — above everything including the logo bar -->
+    <div id="screensaverOverlay" style="
+      position: fixed; inset: 0; z-index: 30;
+      opacity: 0; pointer-events: none;
+    ">
+      <img id="ssSlideA" style="position:absolute;top:50%;left:50%;width:100vw;height:100vh;object-fit:cover;transform:translate(-50%,-50%)" />
     </div>
 
     <div id="loading">
