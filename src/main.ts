@@ -67,13 +67,11 @@ async function main() {
   let screensaverAlpha = 0
   let frameCount = 0
 
-  // Restore saved background image
+  // Restore saved background image, or fall back to the default studio background
   const savedImg = LS.get('bgImage')
-  if (savedImg) {
-    const img = new Image()
-    img.src = savedImg
-    img.onload = () => { bgImage = img }
-  }
+  const img = new Image()
+  img.src = savedImg ?? '/assets/default-bg.jpg'
+  img.onload = () => { bgImage = img }
 
   // Screensaver — single static image
   const screensaverOverlay = document.getElementById('screensaverOverlay') as HTMLDivElement
