@@ -51,7 +51,7 @@ async function main() {
   }
 
   let debugMode = LS.get('debugMode') === '1'
-  let bgEnabled = LS.get('bgEnabled') === '1'
+  let bgEnabled = LS.get('bgEnabled') !== '0'  // default on
   let portraitCam = LS.get('portraitCam') === '1'
   let flipV = LS.get('flipV') === '1'
   let flipH = LS.get('flipH') !== '0'  // default on (mirror mode)
