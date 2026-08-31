@@ -88,12 +88,6 @@ self.onmessage = async (e: MessageEvent) => {
 
       const pha = results['pha'] as ort.Tensor
       const alpha = new Float32Array(pha.data as ArrayLike<number>)
-      // Debug: log alpha stats on first few frames to verify model output
-      if (alpha.length > 0 && Math.random() < 0.02) {
-        let sum = 0, mn = 1, mx = 0
-        for (let i = 0; i < alpha.length; i++) { sum += alpha[i]; if (alpha[i] < mn) mn = alpha[i]; if (alpha[i] > mx) mx = alpha[i] }
-        console.log(`[rvm] alpha mean=${(sum/alpha.length).toFixed(3)} min=${mn.toFixed(3)} max=${mx.toFixed(3)} dims=${pha.dims}`)
-      }
       self.postMessage({ type: 'mask', data: alpha, width: IW, height: IH }, [alpha.buffer])
     } catch (err) {
       const errStr = err instanceof Error ? `${err.name}: ${err.message}\n${(err as Error).stack}` : String(err)

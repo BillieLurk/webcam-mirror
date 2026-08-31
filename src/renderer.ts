@@ -1,8 +1,14 @@
-import type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
+import type { NormalizedLandmark } from './tracker'
 import type { FloatingObject } from './physics'
 import type { ImageInfo, ProductInfo } from './assets'
 import type { AlphaMask } from './segmenter'
 import { detectFist, getPalmCenter } from './tracker'
+
+// Only `.landmarks` is read here — a plain shape (rather than the full class-typed
+// PoseLandmarkerResult/HandLandmarkerResult) so callers can pass smoothed/synthetic
+// landmark data without needing to fake methods like `.close()`.
+type PoseLike = { landmarks: NormalizedLandmark[][] }
+type HandsLike = { landmarks: NormalizedLandmark[][] }
 
 // Offscreen canvases for background compositing, lazily created
 let maskCanvas: OffscreenCanvas | null = null
@@ -194,8 +200,8 @@ export function renderFrame(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement | HTMLCanvasElement,
   objects: FloatingObject[],
-  poseResult: PoseLandmarkerResult | null,
-  handResult: HandLandmarkerResult | null,
+  poseResult: PoseLike | null,
+  handResult: HandsLike | null,
   debugMode: boolean,
   grabbing: Map<number, boolean>,
   hoverObjects: Set<FloatingObject>,

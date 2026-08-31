@@ -4,7 +4,7 @@ import { RVMSegmenter } from './segmenter'
 import { PhysicsScene } from './physics'
 import { renderFrame } from './renderer'
 import { PRODUCT_FILES, preloadImages, getCategoryScale, SCALE_CONFIG, PRODUCT_INFO } from './assets'
-import type { PoseLandmarkerResult, HandLandmarkerResult } from './tracker'
+import type { PoseLandmarkerResult, HandLandmarkerResult, NormalizedLandmark } from './tracker'
 import type { AlphaMask } from './segmenter'
 
 const BODY_INDICES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
@@ -50,7 +50,7 @@ async function main() {
     del: (k: string) => localStorage.removeItem('dm_' + k),
   }
 
-  let debugMode = LS.get('debugMode') === '1'
+  let debugMode = LS.get('debugMode') !== '0'  // default on
   let bgEnabled = LS.get('bgEnabled') !== '0'  // default on
   let portraitCam = LS.get('portraitCam') !== '0'  // default on
   let flipV = LS.get('flipV') === '1'
@@ -60,9 +60,26 @@ async function main() {
   let bgImage: HTMLImageElement | null = null
   let lastPose: PoseLandmarkerResult | null = null
   let lastHands: HandLandmarkerResult | null = null
+  // Tracking only updates ~10-12x/sec (worker round-trip); smoothly chase the latest
+  // landmarks every render frame (~60fps) instead of holding them static between
+  // updates, so the skeleton/hands don't visibly step/jump.
+  let smoothPoseLm: NormalizedLandmark[] | null = null
+  let smoothHandsLm: NormalizedLandmark[][] = []
+  const LM_SMOOTH = 0.4
+  function lerpLandmarks(current: NormalizedLandmark[] | null, target: NormalizedLandmark[] | undefined): NormalizedLandmark[] | null {
+    if (!target) return null
+    if (!current || current.length !== target.length) return target.map(l => ({ ...l }))
+    return current.map((c, i) => ({
+      x: c.x + (target[i].x - c.x) * LM_SMOOTH,
+      y: c.y + (target[i].y - c.y) * LM_SMOOTH,
+      z: c.z + (target[i].z - c.z) * LM_SMOOTH,
+      visibility: target[i].visibility,
+    }))
+  }
   let lastSeg: AlphaMask | null = null
   let prevTimestamp = 0
   let segmentPending = false
+  let trackPending = false
   let personAbsentMs = 0
   let screensaverAlpha = 0
   let debouncedPresent = true
@@ -448,15 +465,17 @@ async function main() {
     const trackSource: HTMLVideoElement | HTMLCanvasElement = (streamRotated && rotCanvas) ? rotCanvas : video
     frameCount++
 
-    // --- Tracking (every 2nd frame — MediaPipe is expensive; physics interpolates between) ---
-    if (frameCount % 2 === 0) {
+    // --- Tracking (worker-backed: non-blocking; guard prevents overlapping calls) ---
+    if (frameCount % 2 === 0 && !trackPending) {
       const trackReady = streamRotated
         ? (rotCanvas !== null && video.readyState >= 2 && video.videoWidth > 0)
         : (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0)
-      const result = trackReady ? tracker.detect(trackSource, ts) : null
-      if (result) {
-        lastPose = result.pose
-        lastHands = result.hands
+      if (trackReady) {
+        trackPending = true
+        tracker.detect(trackSource, ts).then(result => {
+          if (result) { lastPose = result.pose; lastHands = result.hands }
+          trackPending = false
+        }).catch(() => { trackPending = false })
       }
     }
 
@@ -471,9 +490,13 @@ async function main() {
     // Clear stale mask when background replacement is turned off
     if (!bgEnabled && lastSeg) lastSeg = null
 
+    // --- Smooth landmarks toward the latest tracking result, every render frame ---
+    smoothPoseLm = lerpLandmarks(smoothPoseLm, lastPose?.landmarks[0])
+    smoothHandsLm = (lastHands?.landmarks ?? []).map((target, i) => lerpLandmarks(smoothHandsLm[i] ?? null, target)!)
+
     // --- Pose → physics bodies ---
-    if (lastPose && lastPose.landmarks.length > 0) {
-      const lms = lastPose.landmarks[0]
+    if (smoothPoseLm) {
+      const lms = smoothPoseLm
 
       // Compute shoulder width in screen space — used as distance proxy for head radius.
       // Wider shoulders = closer to camera = bigger head collider.
@@ -534,8 +557,8 @@ async function main() {
     }
 
     // --- Hands → physics bodies + grab logic ---
-    if (lastHands) {
-      const count = lastHands.landmarks.length
+    {
+      const count = smoothHandsLm.length
 
       // Release grabs for disappeared hands (no position — throw with zero velocity)
       for (const [i] of pinchWas) {
@@ -546,7 +569,7 @@ async function main() {
       }
 
       for (let i = 0; i < count; i++) {
-        const lms = lastHands.landmarks[i]
+        const lms = smoothHandsLm[i]
 
         const pinching = detectFist(lms)
         const wasPinching = pinchWas.get(i) ?? false
@@ -580,19 +603,17 @@ async function main() {
     // Build grab map and hover set for renderer (reuse pre-allocated collections)
     grabbing.clear()
     hoverObjects.clear()
-    if (lastHands) {
-      for (let i = 0; i < lastHands.landmarks.length; i++) {
-        grabbing.set(i, physics.isGrabbing(i))
-        if (!physics.isGrabbing(i)) {
-          const lms = lastHands.landmarks[i]
-          const palm = getPalmCenter(lms)
-          const [px, py] = lm2canvas(palm.x, palm.y)
-          const wrist = lms[0]
-          const [wristX, wristY] = lm2canvas(wrist.x, wrist.y)
-          const handReach = Math.hypot(wristX - px, wristY - py)
-          const hovered = physics.getHoverObject(i, px, py, handReach * 1.8)
-          if (hovered) hoverObjects.add(hovered)
-        }
+    for (let i = 0; i < smoothHandsLm.length; i++) {
+      grabbing.set(i, physics.isGrabbing(i))
+      if (!physics.isGrabbing(i)) {
+        const lms = smoothHandsLm[i]
+        const palm = getPalmCenter(lms)
+        const [px, py] = lm2canvas(palm.x, palm.y)
+        const wrist = lms[0]
+        const [wristX, wristY] = lm2canvas(wrist.x, wrist.y)
+        const handReach = Math.hypot(wristX - px, wristY - py)
+        const hovered = physics.getHoverObject(i, px, py, handReach * 1.8)
+        if (hovered) hoverObjects.add(hovered)
       }
     }
 
@@ -604,8 +625,8 @@ async function main() {
     while (physics.floatingObjects.length < MAX_OBJECTS) spawnNext()
 
     // --- Body depenetration (after step so collision resolution can't undo it) ---
-    if (lastPose && lastPose.landmarks.length > 0) {
-      const lms = lastPose.landmarks[0]
+    if (smoothPoseLm) {
+      const lms = smoothPoseLm
       const nose = lms[0], s11 = lms[11], s12 = lms[12], h23 = lms[23], h24 = lms[24]
 
       // Torso quad: shoulders + hips
@@ -664,7 +685,11 @@ async function main() {
     // --- Render ---
     // When the stream is already rotated at source, renderer must not re-rotate
     const rendererPortraitCam = portraitCam && !streamRotated
-    renderFrame(ctx, trackSource, physics.floatingObjects, lastPose, lastHands, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgImage, bgEnabled, screensaverAlpha, ts, PRODUCT_INFO, flipV, flipH, rendererPortraitCam)
+    // Render the smoothed landmarks (chased every frame) rather than the raw ~10-12fps
+    // tracking result, so the skeleton/hands don't visibly step between updates.
+    const smoothedPoseResult = smoothPoseLm ? { landmarks: [smoothPoseLm] } : null
+    const smoothedHandsResult = lastHands ? { landmarks: smoothHandsLm } : null
+    renderFrame(ctx, trackSource, physics.floatingObjects, smoothedPoseResult, smoothedHandsResult, debugMode, grabbing, hoverObjects, images, lastSeg, bgColor, bgImage, bgEnabled, screensaverAlpha, ts, PRODUCT_INFO, flipV, flipH, rendererPortraitCam)
 
     requestAnimationFrame(loop)
   }
