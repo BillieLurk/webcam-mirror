@@ -2,7 +2,8 @@
  * RobustVideoMatting (RVM) segmenter — worker-backed.
  *
  * Runs inference in a Web Worker so the main animation loop is never blocked.
- * The worker tries WebGPU → WebGL → WASM in order of preference.
+ * The worker uses the WASM (CPU, multi-threaded) backend — measured faster than
+ * WebGPU for this model on this hardware.
  *
  * Model: public/models/rvm_mobilenetv3.onnx (~7 MB fp16)
  * GitHub: https://github.com/PeterL1n/RobustVideoMatting
@@ -13,10 +14,6 @@ export interface AlphaMask {
   width: number
   height: number
 }
-
-// Small canvas for extracting pixel data from video/canvas each frame (main thread)
-let srcCanvas: OffscreenCanvas | null = null
-let srcCtx: OffscreenCanvasRenderingContext2D | null = null
 
 export class RVMSegmenter {
   private worker: Worker | null = null
@@ -88,20 +85,15 @@ export class RVMSegmenter {
     const IW = Math.max(1, Math.round(W / this.downsampleFactor))
     const IH = Math.max(1, Math.round(H / this.downsampleFactor))
 
-    // Draw source into offscreen canvas to extract pixel data
-    if (!srcCanvas || srcCanvas.width !== IW || srcCanvas.height !== IH) {
-      srcCanvas = new OffscreenCanvas(IW, IH)
-      srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true })!
-    }
-    srcCtx!.drawImage(source, 0, 0, IW, IH)
-    const imageData = srcCtx!.getImageData(0, 0, IW, IH)
-
-    // Transfer pixel buffer to worker (zero-copy — no serialization overhead)
-    const rgba = imageData.data.buffer
+    // Same resolution as before, but extraction moves to the worker: createImageBitmap()
+    // is async/off-main-thread (unlike a synchronous drawImage+getImageData pair, which
+    // would block the render loop on the main thread every frame). The bitmap transfers
+    // to the worker zero-copy, which converts it straight to a tensor via ort.Tensor.fromImage.
+    const bitmap = await createImageBitmap(source, { resizeWidth: IW, resizeHeight: IH, resizeQuality: 'high' })
 
     return new Promise((resolve) => {
       this.pendingResolve = resolve
-      this.worker!.postMessage({ type: 'segment', rgba, width: IW, height: IH }, [rgba])
+      this.worker!.postMessage({ type: 'segment', bitmap, width: IW, height: IH }, [bitmap])
     })
   }
 

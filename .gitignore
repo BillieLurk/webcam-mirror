@@ -2,4 +2,6 @@ node_modules/
 dist/
 .vercel
 public/models/*.onnx
+public/models/*.task
 public/ort/
+public/mediapipe-wasm/

@@ -2,14 +2,19 @@
 /**
  * RVM segmentation Web Worker.
  * Runs ONNX inference off the main thread so the animation loop is never blocked.
- * Tries WebGPU (GPU, fast) → WebGL (GPU, compat) → WASM (CPU, fallback).
+ *
+ * Uses the WASM (CPU, multi-threaded SIMD) backend: measured ~3x faster than WebGPU
+ * for this model on this hardware (~25-30ms/frame vs ~85-90ms/frame), despite WebGPU
+ * confirmed running on real GPU hardware (not a software fallback) — ONNX Runtime
+ * Web's generic WebGPU op-by-op dispatch carries more overhead than its WASM SIMD path
+ * for a model this small.
  */
 import * as ort from 'onnxruntime-web'
 
 // Multi-threading requires SharedArrayBuffer (enabled by COOP/COEP credentialless headers).
 // Falls back to 1 thread automatically if SAB is unavailable.
 ort.env.wasm.numThreads = typeof SharedArrayBuffer !== 'undefined' ? Math.min(navigator.hardwareConcurrency ?? 4, 8) : 1
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/'
+ort.env.wasm.wasmPaths = '/ort/'
 
 const DOWNSAMPLE_RATIO = 0.4
 
@@ -41,14 +46,10 @@ self.onmessage = async (e: MessageEvent) => {
 
   if (type === 'init') {
     try {
-      let backend = 'wasm'
-      session = await tryCreate(['webgpu'])
-      if (session) backend = 'webgpu'
-      if (!session) { session = await tryCreate(['webgl']); if (session) backend = 'webgl' }
-      if (!session) { session = await tryCreate(['wasm']); }
+      session = await tryCreate(['wasm'])
       if (!session) throw new Error('No ONNX backend available')
       resetState()
-      self.postMessage({ type: 'ready', backend })
+      self.postMessage({ type: 'ready', backend: 'wasm' })
     } catch (err) {
       self.postMessage({ type: 'error', message: String(err) })
     }
@@ -63,18 +64,11 @@ self.onmessage = async (e: MessageEvent) => {
   if (type === 'segment') {
     if (!session || !r1) { self.postMessage({ type: 'skip' }); return }
 
-    const { rgba, width: IW, height: IH } = e.data
-    const data = new Uint8ClampedArray(rgba)
-
-    const numPx = IW * IH
-    const rgb32 = new Float32Array(3 * numPx)
-    for (let i = 0; i < numPx; i++) {
-      rgb32[i]             = data[i * 4]     / 255
-      rgb32[i + numPx]     = data[i * 4 + 1] / 255
-      rgb32[i + 2 * numPx] = data[i * 4 + 2] / 255
-    }
-
-    const src = new ort.Tensor('float32', rgb32, [1, 3, IH, IW])
+    const { bitmap, width: IW, height: IH } = e.data as { bitmap: ImageBitmap, width: number, height: number }
+    // fromImage produces the same RGB/NCHW/float32/[0,1]-normalized tensor a manual
+    // drawImage+getImageData+per-pixel-loop would, via ORT's own (faster) conversion path.
+    const src = await ort.Tensor.fromImage(bitmap, {}) as ort.Tensor
+    bitmap.close()
     const dsRatio = new ort.Tensor('float32', [DOWNSAMPLE_RATIO])
     const feeds = {
       src,
@@ -85,7 +79,7 @@ self.onmessage = async (e: MessageEvent) => {
     try {
       const results = await session.run(feeds)
       src.dispose(); dsRatio.dispose()
-      // Dispose old recurrent state tensors to free GPU buffers before replacing
+      // Dispose old recurrent state tensors before replacing
       r1?.dispose(); r2?.dispose(); r3?.dispose(); r4?.dispose()
       r1 = results['r1o'] as ort.Tensor
       r2 = results['r2o'] as ort.Tensor
@@ -104,20 +98,6 @@ self.onmessage = async (e: MessageEvent) => {
     } catch (err) {
       const errStr = err instanceof Error ? `${err.name}: ${err.message}\n${(err as Error).stack}` : String(err)
       console.error('[rvm worker] inference error:', errStr)
-      // Only fall back to WASM if we're currently on a GPU backend (avoid re-creating on every frame)
-      const wasGpu = session !== null
-      if (wasGpu) {
-        try { (session as any).release?.() } catch {}
-        session = null
-        console.warn('[rvm worker] GPU backend failed — falling back to multi-threaded WASM')
-        session = await tryCreate(['wasm'])
-        if (!session) {
-          self.postMessage({ type: 'error', message: 'All ONNX backends failed' })
-          return
-        }
-        resetState()
-        self.postMessage({ type: 'backend', backend: 'wasm-fallback' })
-      }
       self.postMessage({ type: 'skip' })
     }
   }

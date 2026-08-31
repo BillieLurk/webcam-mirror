@@ -52,7 +52,7 @@ async function main() {
 
   let debugMode = LS.get('debugMode') === '1'
   let bgEnabled = LS.get('bgEnabled') !== '0'  // default on
-  let portraitCam = LS.get('portraitCam') === '1'
+  let portraitCam = LS.get('portraitCam') !== '0'  // default on
   let flipV = LS.get('flipV') === '1'
   let flipH = LS.get('flipH') !== '0'  // default on (mirror mode)
   let screensaverEnabled = LS.get('screensaverEnabled') !== '0'
@@ -65,6 +65,8 @@ async function main() {
   let segmentPending = false
   let personAbsentMs = 0
   let screensaverAlpha = 0
+  let debouncedPresent = true
+  let presenceFlipMs = 0
   let frameCount = 0
 
   // Restore saved background image, or fall back to the default studio background
@@ -225,6 +227,20 @@ async function main() {
     uiEl.style.display = menuOpen ? 'flex' : 'none'
     menuBtn.classList.toggle('active', menuOpen)
   })
+
+  // Hide the fullscreen/settings buttons after 5s of mouse inactivity; reveal on movement.
+  let controlsHideTimer: ReturnType<typeof setTimeout>
+  function showControls() {
+    menuBtn.classList.remove('controls-hidden')
+    fullscreenBtn.classList.remove('controls-hidden')
+    clearTimeout(controlsHideTimer)
+    controlsHideTimer = setTimeout(() => {
+      menuBtn.classList.add('controls-hidden')
+      fullscreenBtn.classList.add('controls-hidden')
+    }, 5000)
+  }
+  document.addEventListener('mousemove', showControls)
+  showControls()
 
   // Restore button states from saved settings
   debugBtn.classList.toggle('active', debugMode)
@@ -622,7 +638,18 @@ async function main() {
         }
       }
 
-      if (personPresent) {
+      // Debounce: a single flickered frame from the pose tracker (e.g. brief occlusion)
+      // would otherwise reset personAbsentMs to 0 and freeze screensaverAlpha wherever it
+      // was for up to 3s — visible as the screensaver getting stuck mid-fade. Require the
+      // raw reading to hold for 250ms before it flips the debounced presence state.
+      if (personPresent !== debouncedPresent) {
+        presenceFlipMs += dt
+        if (presenceFlipMs > 250) { debouncedPresent = personPresent; presenceFlipMs = 0 }
+      } else {
+        presenceFlipMs = 0
+      }
+
+      if (debouncedPresent) {
         personAbsentMs = 0
         screensaverAlpha = Math.max(0, screensaverAlpha - dt / 600)
       } else {

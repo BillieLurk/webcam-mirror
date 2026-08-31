@@ -11,11 +11,9 @@ import type {
 
 export type { NormalizedLandmark, PoseLandmarkerResult, HandLandmarkerResult }
 
-const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-const POSE_MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task'
-const HAND_MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task'
+const WASM_URL = '/mediapipe-wasm'
+const POSE_MODEL_URL = '/models/pose_landmarker_lite.task'
+const HAND_MODEL_URL = '/models/hand_landmarker.task'
 
 export class Tracker {
   private poseLandmarker: PoseLandmarker | null = null

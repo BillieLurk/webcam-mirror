@@ -68,6 +68,17 @@
         color: #06ffa5;
       }
 
+      #menuBtn,
+      #fullscreenBtn {
+        transition: opacity 0.4s ease;
+      }
+
+      #menuBtn.controls-hidden,
+      #fullscreenBtn.controls-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
       #status {
         position: fixed;
         bottom: 18px;
